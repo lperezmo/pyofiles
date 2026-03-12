@@ -9,7 +9,7 @@ description = "Fast, Rust-powered file operations for Python"
 requires-python = ">=3.9"
 license = "MIT"
 readme = "README.md"
-keywords = ["files", "filesystem", "rust", "fast", "parallel", "walk", "find", "glob"]
+keywords = ["files", "filesystem", "rust", "fast", "parallel", "walk", "find", "glob", "cli"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -20,8 +20,12 @@ classifiers = [
     "Topic :: System :: Filesystems",
 ]
 
+[project.scripts]
+pyofiles = "pyofiles.cli:main"
+
 [tool.maturin]
 features = ["pyo3/extension-module"]
+python-source = "python"
 
 [dependency-groups]
 dev = [

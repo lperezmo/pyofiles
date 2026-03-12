@@ -2,6 +2,7 @@ use pyo3::prelude::*;
 use pyo3::exceptions::{PyOSError, PyValueError};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 use jwalk::WalkDir;
 use globset::Glob as GlobPattern;
 
@@ -17,6 +18,8 @@ pub struct FileEntry {
     pub is_dir: bool,
     pub size: u64,
     pub extension: String,
+    pub modified: Option<f64>,
+    pub created: Option<f64>,
 }
 
 #[pymethods]
@@ -97,7 +100,11 @@ impl DiskUsage {
 
 // ─── Helpers ────────────────────────────────────────────────
 
-fn make_entry(path: &Path, name: String, is_file: bool, is_dir: bool, size: u64) -> FileEntry {
+fn systemtime_to_epoch(t: SystemTime) -> Option<f64> {
+    t.duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs_f64())
+}
+
+fn make_entry(path: &Path, name: String, is_file: bool, is_dir: bool, size: u64, modified: Option<f64>, created: Option<f64>) -> FileEntry {
     let extension = path.extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
@@ -109,7 +116,35 @@ fn make_entry(path: &Path, name: String, is_file: bool, is_dir: bool, size: u64)
         is_dir,
         size,
         extension,
+        modified,
+        created,
     }
+}
+
+fn check_time_filters(
+    metadata: &std::fs::Metadata,
+    modified_after: Option<f64>,
+    modified_before: Option<f64>,
+    created_after: Option<f64>,
+    created_before: Option<f64>,
+) -> bool {
+    if let Some(after) = modified_after {
+        let mtime = metadata.modified().ok().and_then(systemtime_to_epoch).unwrap_or(0.0);
+        if mtime < after { return false; }
+    }
+    if let Some(before) = modified_before {
+        let mtime = metadata.modified().ok().and_then(systemtime_to_epoch).unwrap_or(f64::MAX);
+        if mtime > before { return false; }
+    }
+    if let Some(after) = created_after {
+        let ctime = metadata.created().ok().and_then(systemtime_to_epoch).unwrap_or(0.0);
+        if ctime < after { return false; }
+    }
+    if let Some(before) = created_before {
+        let ctime = metadata.created().ok().and_then(systemtime_to_epoch).unwrap_or(f64::MAX);
+        if ctime > before { return false; }
+    }
+    true
 }
 
 fn validate_dir(directory: &str) -> PyResult<()> {
@@ -154,17 +189,25 @@ fn get_depth_path(path: &Path, base: &Path, target_depth: usize) -> Option<PathB
 ///     extensions: Optional list of extensions to filter by (e.g. [".py", ".rs"]).
 ///     skip_hidden: Skip hidden files and directories.
 ///     max_depth: Maximum recursion depth.
+///     modified_after: Only include files modified after this unix timestamp.
+///     modified_before: Only include files modified before this unix timestamp.
+///     created_after: Only include files created after this unix timestamp.
+///     created_before: Only include files created before this unix timestamp.
 ///
 /// Returns:
 ///     List of FileEntry objects (both files and directories).
 #[pyfunction]
-#[pyo3(signature = (directory, extensions=None, skip_hidden=false, max_depth=None))]
+#[pyo3(signature = (directory, extensions=None, skip_hidden=false, max_depth=None, modified_after=None, modified_before=None, created_after=None, created_before=None))]
 fn walk(
     py: Python<'_>,
     directory: String,
     extensions: Option<Vec<String>>,
     skip_hidden: bool,
     max_depth: Option<usize>,
+    modified_after: Option<f64>,
+    modified_before: Option<f64>,
+    created_after: Option<f64>,
+    created_before: Option<f64>,
 ) -> PyResult<Vec<FileEntry>> {
     validate_dir(&directory)?;
 
@@ -175,6 +218,8 @@ fn walk(
         }
 
         let exts: Option<Vec<String>> = extensions.map(|e| normalize_exts(&e));
+        let has_time_filters = modified_after.is_some() || modified_before.is_some()
+            || created_after.is_some() || created_before.is_some();
 
         let entries: Vec<FileEntry> = walker
             .into_iter()
@@ -195,13 +240,26 @@ fn walk(
                     }
                 }
 
+                let metadata = path.metadata().ok();
                 let size = if is_file {
-                    path.metadata().map(|m| m.len()).unwrap_or(0)
+                    metadata.as_ref().map(|m| m.len()).unwrap_or(0)
                 } else {
                     0
                 };
 
-                Some(make_entry(&path, name, is_file, is_dir, size))
+                // Time filters (apply to files only, directories always pass)
+                if is_file && has_time_filters {
+                    if let Some(ref meta) = metadata {
+                        if !check_time_filters(meta, modified_after, modified_before, created_after, created_before) {
+                            return None;
+                        }
+                    }
+                }
+
+                let modified = metadata.as_ref().and_then(|m| m.modified().ok()).and_then(systemtime_to_epoch);
+                let created = metadata.as_ref().and_then(|m| m.created().ok()).and_then(systemtime_to_epoch);
+
+                Some(make_entry(&path, name, is_file, is_dir, size, modified, created))
             })
             .collect();
 
@@ -241,7 +299,9 @@ fn list_dir(
                 } else {
                     0
                 };
-                entries.push(make_entry(&path, name, is_file, is_dir, size));
+                let modified = metadata.as_ref().and_then(|m| m.modified().ok()).and_then(systemtime_to_epoch);
+                let created = metadata.as_ref().and_then(|m| m.created().ok()).and_then(systemtime_to_epoch);
+                entries.push(make_entry(&path, name, is_file, is_dir, size, modified, created));
             }
         }
         Ok(entries)
@@ -261,6 +321,10 @@ fn list_dir(
 ///     max_size_mb: Maximum file size in megabytes.
 ///     skip_hidden: Skip hidden files and directories.
 ///     max_depth: Maximum recursion depth.
+///     modified_after: Only include files modified after this unix timestamp.
+///     modified_before: Only include files modified before this unix timestamp.
+///     created_after: Only include files created after this unix timestamp.
+///     created_before: Only include files created before this unix timestamp.
 ///
 /// Returns:
 ///     List of matching FileEntry objects (files only).
@@ -268,7 +332,7 @@ fn list_dir(
 /// Example:
 ///     find("/data", names=["report", "summary"], extensions=[".pdf", ".docx"])
 #[pyfunction]
-#[pyo3(signature = (directory, names=None, extensions=None, min_size_mb=None, max_size_mb=None, skip_hidden=false, max_depth=None))]
+#[pyo3(signature = (directory, names=None, extensions=None, min_size_mb=None, max_size_mb=None, skip_hidden=false, max_depth=None, modified_after=None, modified_before=None, created_after=None, created_before=None))]
 fn find(
     py: Python<'_>,
     directory: String,
@@ -278,12 +342,19 @@ fn find(
     max_size_mb: Option<f64>,
     skip_hidden: bool,
     max_depth: Option<usize>,
+    modified_after: Option<f64>,
+    modified_before: Option<f64>,
+    created_after: Option<f64>,
+    created_before: Option<f64>,
 ) -> PyResult<Vec<FileEntry>> {
     validate_dir(&directory)?;
 
-    if names.is_none() && extensions.is_none() {
+    if names.is_none() && extensions.is_none()
+        && modified_after.is_none() && modified_before.is_none()
+        && created_after.is_none() && created_before.is_none()
+    {
         return Err(PyValueError::new_err(
-            "Must provide at least `names` or `extensions`"
+            "Must provide at least `names`, `extensions`, or a time filter"
         ));
     }
 
@@ -326,8 +397,9 @@ fn find(
                     }
                 }
 
-                // Size filters
-                let size = path.metadata().map(|m| m.len()).unwrap_or(0);
+                // Size and time filters (single metadata call)
+                let metadata = path.metadata().ok();
+                let size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
                 if let Some(min) = min_bytes {
                     if size < min { return None; }
                 }
@@ -335,7 +407,17 @@ fn find(
                     if size > max { return None; }
                 }
 
-                Some(make_entry(&path, name, true, false, size))
+                // Time filters
+                if let Some(ref meta) = metadata {
+                    if !check_time_filters(meta, modified_after, modified_before, created_after, created_before) {
+                        return None;
+                    }
+                }
+
+                let modified = metadata.as_ref().and_then(|m| m.modified().ok()).and_then(systemtime_to_epoch);
+                let created = metadata.as_ref().and_then(|m| m.created().ok()).and_then(systemtime_to_epoch);
+
+                Some(make_entry(&path, name, true, false, size, modified, created))
             })
             .collect();
 

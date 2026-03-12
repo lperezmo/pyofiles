@@ -42,3 +42,5 @@ references/
 *.log
 
 .claude/
+
+*.pdb
