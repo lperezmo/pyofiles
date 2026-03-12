@@ -26,4 +26,5 @@ jobs:
         run: |
           pip install dist/*.whl
           python -c "import pyofiles; print('walk:', len(pyofiles.walk('.'))); print('find:', len(pyofiles.find('.', extensions=['.rs']))); print('glob:', len(pyofiles.glob('.', '**/*.toml'))); print('list_dir:', len(pyofiles.list_dir('.'))); print('index:', len(pyofiles.index('.', ['.rs', '.toml']))); usage = pyofiles.disk_usage('.'); print(f'disk_usage: {usage.total_files} files, {usage.total_size_mb:.2f} MB'); print('All OK')"
+          python tests/test_pyofiles.py
         shell: bash
