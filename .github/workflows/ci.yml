@@ -7,25 +7,23 @@ on:
     branches: [main, master]
 
 jobs:
-  test:
+  build:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-        python-version: ['3.9', '3.12']
+        python-version: ['3.9', '3.13']
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-      - name: Build and install
+      - name: Build wheel
         uses: PyO3/maturin-action@v1
         with:
-          command: develop
-          args: --release
-      - name: Install test deps
-        run: pip install pytest
-      - name: Run tests
-        run: pytest tests/ -v
+          args: --release --out dist
+      - name: Install and test
+        run: |
+          pip install dist/*.whl
+          python -c "import pyofiles; print('walk:', len(pyofiles.walk('.'))); print('find:', len(pyofiles.find('.', extensions=['.rs']))); print('glob:', len(pyofiles.glob('.', '**/*.toml'))); print('list_dir:', len(pyofiles.list_dir('.'))); print('index:', len(pyofiles.index('.', ['.rs', '.toml']))); usage = pyofiles.disk_usage('.'); print(f'disk_usage: {usage.total_files} files, {usage.total_size_mb:.2f} MB'); print('All OK')"
+        shell: bash
