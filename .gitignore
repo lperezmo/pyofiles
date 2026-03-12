@@ -1,0 +1,44 @@
+# Rust
+/target
+Cargo.lock
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+build/
+*.whl
+*.so
+*.pyd
+*.dll
+
+# Maturin
+target/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.vs/
+
+# OS
+.DS_Store
+desktop.ini
+Thumbs.db
+
+# References (local only)
+references/
+
+# Misc
+*.log
+
+.claude/

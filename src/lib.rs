@@ -1,0 +1,528 @@
+use pyo3::prelude::*;
+use pyo3::exceptions::{PyOSError, PyValueError};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use jwalk::WalkDir;
+use globset::Glob as GlobPattern;
+
+// ─── Data Types ─────────────────────────────────────────────
+
+/// A file or directory entry returned by walk/find/list_dir.
+#[pyclass(frozen, get_all)]
+#[derive(Clone, Debug)]
+pub struct FileEntry {
+    pub path: String,
+    pub name: String,
+    pub is_file: bool,
+    pub is_dir: bool,
+    pub size: u64,
+    pub extension: String,
+}
+
+#[pymethods]
+impl FileEntry {
+    fn __repr__(&self) -> String {
+        if self.is_file {
+            format!("FileEntry('{}', size={})", self.name, self.size)
+        } else {
+            format!("FileEntry('{}', dir)", self.name)
+        }
+    }
+
+    fn __str__(&self) -> &str {
+        &self.path
+    }
+}
+
+/// A disk usage entry for a path.
+#[pyclass(frozen, get_all)]
+#[derive(Clone, Debug)]
+pub struct SizeEntry {
+    pub path: String,
+    pub size: u64,
+    pub file_count: usize,
+}
+
+#[pymethods]
+impl SizeEntry {
+    fn __repr__(&self) -> String {
+        format!("SizeEntry('{}', size={}, files={})", self.path, self.size, self.file_count)
+    }
+
+    #[getter]
+    fn size_mb(&self) -> f64 {
+        self.size as f64 / (1024.0 * 1024.0)
+    }
+
+    #[getter]
+    fn size_gb(&self) -> f64 {
+        self.size as f64 / (1024.0 * 1024.0 * 1024.0)
+    }
+}
+
+/// Result of disk_usage analysis.
+#[pyclass(frozen)]
+pub struct DiskUsage {
+    #[pyo3(get)]
+    pub total_size: u64,
+    #[pyo3(get)]
+    pub total_files: usize,
+    entries_vec: Vec<SizeEntry>,
+}
+
+#[pymethods]
+impl DiskUsage {
+    #[getter]
+    fn entries(&self) -> Vec<SizeEntry> {
+        self.entries_vec.clone()
+    }
+
+    #[getter]
+    fn total_size_mb(&self) -> f64 {
+        self.total_size as f64 / (1024.0 * 1024.0)
+    }
+
+    #[getter]
+    fn total_size_gb(&self) -> f64 {
+        self.total_size as f64 / (1024.0 * 1024.0 * 1024.0)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "DiskUsage(total_size={}, total_files={}, top_entries={})",
+            self.total_size, self.total_files, self.entries_vec.len()
+        )
+    }
+}
+
+// ─── Helpers ────────────────────────────────────────────────
+
+fn make_entry(path: &Path, name: String, is_file: bool, is_dir: bool, size: u64) -> FileEntry {
+    let extension = path.extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_string();
+    FileEntry {
+        path: path.to_string_lossy().to_string(),
+        name,
+        is_file,
+        is_dir,
+        size,
+        extension,
+    }
+}
+
+fn validate_dir(directory: &str) -> PyResult<()> {
+    let path = Path::new(directory);
+    if !path.exists() {
+        return Err(PyOSError::new_err(format!("Path not found: {}", directory)));
+    }
+    if !path.is_dir() {
+        return Err(PyValueError::new_err(format!("Not a directory: {}", directory)));
+    }
+    Ok(())
+}
+
+/// Normalize extensions: ensure they start with '.' and are lowercase.
+fn normalize_exts(extensions: &[String]) -> Vec<String> {
+    extensions.iter().map(|s| {
+        let s = s.to_lowercase();
+        if s.starts_with('.') { s } else { format!(".{}", s) }
+    }).collect()
+}
+
+fn get_depth_path(path: &Path, base: &Path, target_depth: usize) -> Option<PathBuf> {
+    let relative = path.strip_prefix(base).ok()?;
+    let components: Vec<_> = relative.components().collect();
+    if components.is_empty() {
+        return None;
+    }
+    let depth = components.len().min(target_depth);
+    let mut result = base.to_path_buf();
+    for component in &components[..depth] {
+        result.push(component);
+    }
+    Some(result)
+}
+
+// ─── Functions ──────────────────────────────────────────────
+
+/// Recursively walk a directory in parallel, returning all entries.
+///
+/// Args:
+///     directory: Path to walk.
+///     extensions: Optional list of extensions to filter by (e.g. [".py", ".rs"]).
+///     skip_hidden: Skip hidden files and directories.
+///     max_depth: Maximum recursion depth.
+///
+/// Returns:
+///     List of FileEntry objects (both files and directories).
+#[pyfunction]
+#[pyo3(signature = (directory, extensions=None, skip_hidden=false, max_depth=None))]
+fn walk(
+    py: Python<'_>,
+    directory: String,
+    extensions: Option<Vec<String>>,
+    skip_hidden: bool,
+    max_depth: Option<usize>,
+) -> PyResult<Vec<FileEntry>> {
+    validate_dir(&directory)?;
+
+    py.detach(|| {
+        let mut walker = WalkDir::new(&directory).skip_hidden(skip_hidden);
+        if let Some(depth) = max_depth {
+            walker = walker.max_depth(depth);
+        }
+
+        let exts: Option<Vec<String>> = extensions.map(|e| normalize_exts(&e));
+
+        let entries: Vec<FileEntry> = walker
+            .into_iter()
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().to_string();
+                let is_file = entry.file_type().is_file();
+                let is_dir = entry.file_type().is_dir();
+
+                // Filter files by extension (directories always pass)
+                if is_file {
+                    if let Some(ref exts) = exts {
+                        let name_lower = name.to_lowercase();
+                        if !exts.iter().any(|e| name_lower.ends_with(e)) {
+                            return None;
+                        }
+                    }
+                }
+
+                let size = if is_file {
+                    path.metadata().map(|m| m.len()).unwrap_or(0)
+                } else {
+                    0
+                };
+
+                Some(make_entry(&path, name, is_file, is_dir, size))
+            })
+            .collect();
+
+        Ok(entries)
+    })
+}
+
+/// List contents of a single directory (non-recursive).
+///
+/// Args:
+///     directory: Path to list.
+///
+/// Returns:
+///     List of FileEntry objects in the directory.
+#[pyfunction]
+#[pyo3(signature = (directory))]
+fn list_dir(
+    py: Python<'_>,
+    directory: String,
+) -> PyResult<Vec<FileEntry>> {
+    validate_dir(&directory)?;
+
+    py.detach(|| {
+        let mut entries = Vec::new();
+        let dir = std::fs::read_dir(&directory)
+            .map_err(|e| PyOSError::new_err(format!("Cannot read directory: {}", e)))?;
+
+        for item in dir {
+            if let Ok(item) = item {
+                let path = item.path();
+                let name = item.file_name().to_string_lossy().to_string();
+                let metadata = item.metadata().ok();
+                let is_file = metadata.as_ref().map(|m| m.is_file()).unwrap_or(false);
+                let is_dir = metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+                let size = if is_file {
+                    metadata.as_ref().map(|m| m.len()).unwrap_or(0)
+                } else {
+                    0
+                };
+                entries.push(make_entry(&path, name, is_file, is_dir, size));
+            }
+        }
+        Ok(entries)
+    })
+}
+
+/// Find files matching name substrings, extensions, and/or size filters.
+///
+/// The primary search function. `names` accepts a list of substrings --
+/// a file matches if its name contains ANY of the given substrings (case-insensitive).
+///
+/// Args:
+///     directory: Root directory to search.
+///     names: List of substrings to match against filenames (case-insensitive, OR logic).
+///     extensions: Optional list of extensions to filter by.
+///     min_size_mb: Minimum file size in megabytes.
+///     max_size_mb: Maximum file size in megabytes.
+///     skip_hidden: Skip hidden files and directories.
+///     max_depth: Maximum recursion depth.
+///
+/// Returns:
+///     List of matching FileEntry objects (files only).
+///
+/// Example:
+///     find("/data", names=["report", "summary"], extensions=[".pdf", ".docx"])
+#[pyfunction]
+#[pyo3(signature = (directory, names=None, extensions=None, min_size_mb=None, max_size_mb=None, skip_hidden=false, max_depth=None))]
+fn find(
+    py: Python<'_>,
+    directory: String,
+    names: Option<Vec<String>>,
+    extensions: Option<Vec<String>>,
+    min_size_mb: Option<f64>,
+    max_size_mb: Option<f64>,
+    skip_hidden: bool,
+    max_depth: Option<usize>,
+) -> PyResult<Vec<FileEntry>> {
+    validate_dir(&directory)?;
+
+    if names.is_none() && extensions.is_none() {
+        return Err(PyValueError::new_err(
+            "Must provide at least `names` or `extensions`"
+        ));
+    }
+
+    py.detach(|| {
+        let mut walker = WalkDir::new(&directory).skip_hidden(skip_hidden);
+        if let Some(depth) = max_depth {
+            walker = walker.max_depth(depth);
+        }
+
+        let names_lower: Option<Vec<String>> =
+            names.map(|n| n.iter().map(|s| s.to_lowercase()).collect());
+        let exts_lower: Option<Vec<String>> =
+            extensions.map(|e| normalize_exts(&e));
+        let min_bytes = min_size_mb.map(|mb| (mb * 1024.0 * 1024.0) as u64);
+        let max_bytes = max_size_mb.map(|mb| (mb * 1024.0 * 1024.0) as u64);
+
+        let entries: Vec<FileEntry> = walker
+            .into_iter()
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                if !entry.file_type().is_file() {
+                    return None;
+                }
+
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().to_string();
+                let name_lower = name.to_lowercase();
+
+                // Name substring match (any substring matches -> include)
+                if let Some(ref patterns) = names_lower {
+                    if !patterns.iter().any(|p| name_lower.contains(p)) {
+                        return None;
+                    }
+                }
+
+                // Extension match
+                if let Some(ref exts) = exts_lower {
+                    if !exts.iter().any(|e| name_lower.ends_with(e)) {
+                        return None;
+                    }
+                }
+
+                // Size filters
+                let size = path.metadata().map(|m| m.len()).unwrap_or(0);
+                if let Some(min) = min_bytes {
+                    if size < min { return None; }
+                }
+                if let Some(max) = max_bytes {
+                    if size > max { return None; }
+                }
+
+                Some(make_entry(&path, name, true, false, size))
+            })
+            .collect();
+
+        Ok(entries)
+    })
+}
+
+/// Build a file index grouped by filename stem.
+///
+/// Returns a dict mapping lowercase filename stems to dicts of {extension: full_path}.
+/// Useful for finding related files with different extensions.
+///
+/// Args:
+///     directory: Root directory to index.
+///     extensions: Extensions to index (e.g. [".py", ".pyi", ".pyc"]).
+///     skip_hidden: Skip hidden files.
+///
+/// Returns:
+///     Dict like {"main": {".py": "/src/main.py", ".pyc": "/src/main.pyc"}}
+#[pyfunction]
+#[pyo3(signature = (directory, extensions, skip_hidden=false))]
+fn index(
+    py: Python<'_>,
+    directory: String,
+    extensions: Vec<String>,
+    skip_hidden: bool,
+) -> PyResult<HashMap<String, HashMap<String, String>>> {
+    validate_dir(&directory)?;
+
+    py.detach(|| {
+        let exts = normalize_exts(&extensions);
+        let mut file_index: HashMap<String, HashMap<String, String>> = HashMap::new();
+
+        for entry in WalkDir::new(&directory).skip_hidden(skip_hidden) {
+            if let Ok(entry) = entry {
+                if entry.file_type().is_file() {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    let name_lower = name.to_lowercase();
+
+                    for ext in &exts {
+                        if name_lower.ends_with(ext) {
+                            let key = name_lower.strip_suffix(ext).unwrap_or(&name_lower).to_string();
+                            let full_path = entry.path().to_string_lossy().to_string();
+                            file_index
+                                .entry(key)
+                                .or_default()
+                                .insert(ext.clone(), full_path);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(file_index)
+    })
+}
+
+/// Match files against a glob pattern.
+///
+/// Args:
+///     directory: Root directory to search.
+///     pattern: Glob pattern (e.g. "**/*.py", "src/*.rs", "*.{js,ts}").
+///     skip_hidden: Skip hidden files.
+///
+/// Returns:
+///     List of full paths matching the pattern.
+#[pyfunction]
+#[pyo3(signature = (directory, pattern, skip_hidden=false))]
+fn glob(
+    py: Python<'_>,
+    directory: String,
+    pattern: String,
+    skip_hidden: bool,
+) -> PyResult<Vec<String>> {
+    validate_dir(&directory)?;
+
+    py.detach(|| {
+        let matcher = GlobPattern::new(&pattern)
+            .map_err(|e| PyValueError::new_err(format!("Invalid glob pattern: {}", e)))?
+            .compile_matcher();
+
+        let base = Path::new(&directory);
+
+        let paths: Vec<String> = WalkDir::new(&directory)
+            .skip_hidden(skip_hidden)
+            .into_iter()
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                if !entry.file_type().is_file() {
+                    return None;
+                }
+                let path = entry.path();
+                let relative = path.strip_prefix(base).ok()?;
+                // Normalize separators for cross-platform glob matching
+                let rel_str = relative.to_string_lossy().replace('\\', "/");
+                if matcher.is_match(&rel_str) {
+                    Some(path.to_string_lossy().to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        Ok(paths)
+    })
+}
+
+/// Analyze disk space usage by directory.
+///
+/// Groups files into buckets at the specified depth and returns them sorted
+/// by size (largest first).
+///
+/// Args:
+///     directory: Path to analyze.
+///     depth: Directory depth for grouping (default: 1).
+///     top: Number of top entries to return (default: 20).
+///     skip_hidden: Skip hidden files and directories.
+///
+/// Returns:
+///     DiskUsage object with .entries, .total_size, .total_files, .total_size_mb, .total_size_gb.
+#[pyfunction]
+#[pyo3(signature = (directory, depth=1, top=20, skip_hidden=false))]
+fn disk_usage(
+    py: Python<'_>,
+    directory: String,
+    depth: usize,
+    top: usize,
+    skip_hidden: bool,
+) -> PyResult<DiskUsage> {
+    validate_dir(&directory)?;
+
+    py.detach(|| {
+        let base = Path::new(&directory);
+        let mut folder_sizes: HashMap<String, (u64, usize)> = HashMap::new();
+        let mut total_size: u64 = 0;
+        let mut total_files: usize = 0;
+
+        for entry in WalkDir::new(&directory).skip_hidden(skip_hidden) {
+            if let Ok(entry) = entry {
+                if entry.file_type().is_file() {
+                    let path = entry.path();
+                    let size = path.metadata().map(|m| m.len()).unwrap_or(0);
+                    total_size += size;
+                    total_files += 1;
+
+                    if let Some(bucket) = get_depth_path(&path, base, depth) {
+                        let key = bucket.to_string_lossy().to_string();
+                        let counter = folder_sizes.entry(key).or_insert((0, 0));
+                        counter.0 += size;
+                        counter.1 += 1;
+                    }
+                }
+            }
+        }
+
+        let mut entries: Vec<SizeEntry> = folder_sizes
+            .into_iter()
+            .map(|(path, (size, count))| SizeEntry {
+                path,
+                size,
+                file_count: count,
+            })
+            .collect();
+
+        entries.sort_by(|a, b| b.size.cmp(&a.size));
+        entries.truncate(top);
+
+        Ok(DiskUsage {
+            total_size,
+            total_files,
+            entries_vec: entries,
+        })
+    })
+}
+
+// ─── Module ─────────────────────────────────────────────────
+
+#[pymodule]
+fn pyofiles(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<FileEntry>()?;
+    m.add_class::<SizeEntry>()?;
+    m.add_class::<DiskUsage>()?;
+    m.add_function(wrap_pyfunction!(walk, m)?)?;
+    m.add_function(wrap_pyfunction!(list_dir, m)?)?;
+    m.add_function(wrap_pyfunction!(find, m)?)?;
+    m.add_function(wrap_pyfunction!(index, m)?)?;
+    m.add_function(wrap_pyfunction!(glob, m)?)?;
+    m.add_function(wrap_pyfunction!(disk_usage, m)?)?;
+    Ok(())
+}
