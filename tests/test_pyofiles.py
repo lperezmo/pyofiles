@@ -309,6 +309,162 @@ def test_time_filters():
           f"count={len(found_old)}")
 
 
+def test_walk_name_and_size_filters():
+    section("walk — name and size filters")
+    root = str(FIXTURES)
+
+    # walk with names filter
+    entries = pyofiles.walk(root, names=["main"])
+    file_names = {e.name for e in entries if e.is_file}
+    check("walk names=['main'] finds main files",
+          "main.py" in file_names and "main.pyc" in file_names,
+          f"got {file_names}")
+
+    # walk with min_size_mb — only large_file.bin is >1MB
+    entries = pyofiles.walk(root, min_size_mb=1)
+    file_names = {e.name for e in entries if e.is_file}
+    check("walk min_size_mb=1 finds large file",
+          file_names == {"large_file.bin"},
+          f"got {file_names}")
+
+    # walk with max_size_mb — should exclude large_file.bin
+    entries = pyofiles.walk(root, max_size_mb=1)
+    file_names = {e.name for e in entries if e.is_file}
+    check("walk max_size_mb=1 excludes large file",
+          "large_file.bin" not in file_names,
+          f"got {file_names}")
+
+
+def test_list_dir_filters():
+    section("list_dir — filters")
+    root = str(FIXTURES)
+
+    # extension filter
+    entries = pyofiles.list_dir(root, extensions=[".txt"])
+    file_names = {e.name for e in entries if e.is_file}
+    check("list_dir ext=.txt", "readme.txt" in file_names, f"got {file_names}")
+    check("list_dir ext=.txt excludes pdf", "report_2024.pdf" not in file_names)
+
+    # skip_hidden
+    entries = pyofiles.list_dir(root, skip_hidden=True)
+    names = {e.name for e in entries}
+    check("list_dir skip_hidden", ".hidden_file.txt" not in names)
+
+    entries_all = pyofiles.list_dir(root, skip_hidden=False)
+    names_all = {e.name for e in entries_all}
+    check("list_dir shows hidden by default", ".hidden_file.txt" in names_all)
+
+    # names filter
+    entries = pyofiles.list_dir(root, names=["report"])
+    file_names = {e.name for e in entries if e.is_file}
+    check("list_dir names=['report']", "report_2024.pdf" in file_names, f"got {file_names}")
+
+    # time filter
+    now = time.time()
+    entries = pyofiles.list_dir(root, modified_after=now - 60)
+    file_names = {e.name for e in entries if e.is_file}
+    check("list_dir modified_after finds recent", len(file_names) > 0, f"got {file_names}")
+
+
+def test_glob_filters():
+    section("glob — filters")
+    root = str(FIXTURES)
+
+    # max_depth
+    paths = pyofiles.glob(root, "**/*.py", max_depth=2)
+    basenames = {os.path.basename(p) for p in paths}
+    check("glob max_depth=2 excludes deep files", "io.py" not in basenames,
+          f"basenames={basenames}")
+
+    # time filter
+    now = time.time()
+    paths = pyofiles.glob(root, "**/*.py", modified_after=now - 60)
+    basenames = {os.path.basename(p) for p in paths}
+    check("glob modified_after finds recent .py", "main.py" in basenames,
+          f"basenames={basenames}")
+
+    paths_old = pyofiles.glob(root, "**/*.py", modified_before=now - 60)
+    check("glob modified_before excludes recent", len(paths_old) == 0,
+          f"count={len(paths_old)}")
+
+    # size filter
+    paths = pyofiles.glob(root, "**/*", min_size_mb=1)
+    basenames = {os.path.basename(p) for p in paths}
+    check("glob min_size_mb=1 finds large file", "large_file.bin" in basenames,
+          f"basenames={basenames}")
+
+
+def test_index_filters():
+    section("index — filters")
+
+    # max_depth — index src/ with max_depth=1, should not find helpers/io
+    idx = pyofiles.index(str(FIXTURES / "src"), extensions=[".py", ".pyi"], max_depth=1)
+    check("index max_depth=1 excludes deep", "io" not in idx, f"keys={list(idx.keys())}")
+    check("index max_depth=1 includes shallow", "main" in idx, f"keys={list(idx.keys())}")
+
+    # time filter
+    now = time.time()
+    idx = pyofiles.index(str(FIXTURES / "src"), extensions=[".py"], modified_after=now - 60)
+    check("index modified_after finds recent", "main" in idx, f"keys={list(idx.keys())}")
+
+    idx_old = pyofiles.index(str(FIXTURES / "src"), extensions=[".py"], modified_before=now - 60)
+    check("index modified_before excludes recent", len(idx_old) == 0,
+          f"keys={list(idx_old.keys())}")
+
+    # names filter
+    idx = pyofiles.index(str(FIXTURES / "src"), extensions=[".py", ".pyi", ".pyc"], names=["io"])
+    check("index names=['io']", "io" in idx and "main" not in idx,
+          f"keys={list(idx.keys())}")
+
+
+def test_disk_usage_filters():
+    section("disk_usage — filters")
+    root = str(FIXTURES)
+
+    # extensions filter — only .py files
+    usage = pyofiles.disk_usage(root, extensions=[".py"])
+    py_names = set()
+    for e in usage.entries:
+        py_names.add(os.path.basename(e.path))
+    check("du extensions=.py counts only py", usage.total_files > 0,
+          f"total_files={usage.total_files}")
+    # total size should be much less than the 1.5MB large_file.bin
+    check("du extensions=.py small total", usage.total_size < 500_000,
+          f"total_size={usage.total_size}")
+
+    # names filter
+    usage = pyofiles.disk_usage(root, names=["large"])
+    check("du names=['large'] finds large file", usage.total_files == 1,
+          f"total_files={usage.total_files}")
+    check("du names=['large'] correct size", usage.total_size >= 1_400_000,
+          f"total_size={usage.total_size}")
+
+    # time filter
+    now = time.time()
+    usage = pyofiles.disk_usage(root, modified_after=now - 60)
+    check("du modified_after finds recent", usage.total_files > 0,
+          f"total_files={usage.total_files}")
+
+    usage_old = pyofiles.disk_usage(root, modified_before=now - 60)
+    check("du modified_before excludes recent", usage_old.total_files == 0,
+          f"total_files={usage_old.total_files}")
+
+    # min_size_mb filter
+    usage = pyofiles.disk_usage(root, min_size_mb=1)
+    check("du min_size_mb=1 only large", usage.total_files == 1,
+          f"total_files={usage.total_files}")
+
+
+def test_find_size_only():
+    section("find — size filter only")
+    root = str(FIXTURES)
+
+    # find with only size filter (no names or extensions) — should work now
+    results = pyofiles.find(root, min_size_mb=1)
+    found = {e.name for e in results}
+    check("find min_size_mb=1 alone works", "large_file.bin" in found, f"found={found}")
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -325,6 +481,12 @@ def main():
         test_glob()
         test_disk_usage()
         test_time_filters()
+        test_walk_name_and_size_filters()
+        test_list_dir_filters()
+        test_glob_filters()
+        test_index_filters()
+        test_disk_usage_filters()
+        test_find_size_only()
     finally:
         teardown_fixtures()
 

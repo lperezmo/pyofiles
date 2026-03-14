@@ -149,6 +149,18 @@ def add_output_args(parser: argparse.ArgumentParser):
     parser.add_argument("-l", "--long", action="store_true", help="long format (type, size, modified, path)")
 
 
+def add_name_args(parser: argparse.ArgumentParser):
+    """Add name substring filter arguments to a subparser."""
+    parser.add_argument("--names", nargs="+", default=None,
+                        help="name substrings to match (OR logic)")
+
+
+def add_size_args(parser: argparse.ArgumentParser):
+    """Add size filter arguments to a subparser."""
+    parser.add_argument("--min-size", type=float, default=None, help="min file size in MB")
+    parser.add_argument("--max-size", type=float, default=None, help="max file size in MB")
+
+
 # ---------------------------------------------------------------------------
 # Subcommands
 # ---------------------------------------------------------------------------
@@ -159,6 +171,9 @@ def cmd_walk(args):
         extensions=args.ext,
         skip_hidden=args.skip_hidden,
         max_depth=args.max_depth,
+        names=args.names,
+        min_size_mb=args.min_size,
+        max_size_mb=args.max_size,
         modified_after=args.modified_after,
         modified_before=args.modified_before,
         created_after=args.created_after,
@@ -185,7 +200,18 @@ def cmd_find(args):
 
 
 def cmd_ls(args):
-    entries = pyofiles.list_dir(args.directory)
+    entries = pyofiles.list_dir(
+        args.directory,
+        extensions=args.ext,
+        names=args.names,
+        min_size_mb=args.min_size,
+        max_size_mb=args.max_size,
+        skip_hidden=args.skip_hidden,
+        modified_after=args.modified_after,
+        modified_before=args.modified_before,
+        created_after=args.created_after,
+        created_before=args.created_before,
+    )
     print_entries(entries, as_json=args.as_json, long=args.long)
 
 
@@ -194,6 +220,13 @@ def cmd_glob(args):
         args.directory,
         args.pattern,
         skip_hidden=args.skip_hidden,
+        max_depth=args.max_depth,
+        min_size_mb=args.min_size,
+        max_size_mb=args.max_size,
+        modified_after=args.modified_after,
+        modified_before=args.modified_before,
+        created_after=args.created_after,
+        created_before=args.created_before,
     )
     if args.as_json:
         print(json.dumps(paths, indent=2))
@@ -207,6 +240,14 @@ def cmd_index(args):
         args.directory,
         extensions=args.ext,
         skip_hidden=args.skip_hidden,
+        max_depth=args.max_depth,
+        names=args.names,
+        min_size_mb=args.min_size,
+        max_size_mb=args.max_size,
+        modified_after=args.modified_after,
+        modified_before=args.modified_before,
+        created_after=args.created_after,
+        created_before=args.created_before,
     )
     if args.as_json:
         print(json.dumps(idx, indent=2))
@@ -222,6 +263,14 @@ def cmd_du(args):
         depth=args.depth,
         top=args.top,
         skip_hidden=args.skip_hidden,
+        extensions=args.ext,
+        names=args.names,
+        min_size_mb=args.min_size,
+        max_size_mb=args.max_size,
+        modified_after=args.modified_after,
+        modified_before=args.modified_before,
+        created_after=args.created_after,
+        created_before=args.created_before,
     )
     print_disk_usage(usage, as_json=args.as_json)
 
@@ -243,6 +292,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_walk.add_argument("--ext", nargs="+", default=None, help="filter by extensions (e.g. .py .rs)")
     p_walk.add_argument("--skip-hidden", action="store_true", help="skip hidden files/dirs")
     p_walk.add_argument("--max-depth", type=int, default=None, help="max recursion depth")
+    add_name_args(p_walk)
+    add_size_args(p_walk)
     add_time_args(p_walk)
     add_output_args(p_walk)
     p_walk.set_defaults(func=cmd_walk)
@@ -250,12 +301,11 @@ def build_parser() -> argparse.ArgumentParser:
     # -- find --
     p_find = sub.add_parser("find", help="find files by name, extension, size, or time")
     p_find.add_argument("directory", nargs="?", default=".", help="directory to search (default: .)")
-    p_find.add_argument("--names", nargs="+", default=None, help="name substrings to match (OR logic)")
     p_find.add_argument("--ext", nargs="+", default=None, help="filter by extensions")
-    p_find.add_argument("--min-size", type=float, default=None, help="min file size in MB")
-    p_find.add_argument("--max-size", type=float, default=None, help="max file size in MB")
     p_find.add_argument("--skip-hidden", action="store_true", help="skip hidden files/dirs")
     p_find.add_argument("--max-depth", type=int, default=None, help="max recursion depth")
+    add_name_args(p_find)
+    add_size_args(p_find)
     add_time_args(p_find)
     add_output_args(p_find)
     p_find.set_defaults(func=cmd_find)
@@ -263,6 +313,11 @@ def build_parser() -> argparse.ArgumentParser:
     # -- ls --
     p_ls = sub.add_parser("ls", help="list directory contents (non-recursive)")
     p_ls.add_argument("directory", nargs="?", default=".", help="directory to list (default: .)")
+    p_ls.add_argument("--ext", nargs="+", default=None, help="filter by extensions")
+    p_ls.add_argument("--skip-hidden", action="store_true", help="skip hidden files/dirs")
+    add_name_args(p_ls)
+    add_size_args(p_ls)
+    add_time_args(p_ls)
     add_output_args(p_ls)
     p_ls.set_defaults(func=cmd_ls)
 
@@ -271,6 +326,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_glob.add_argument("directory", nargs="?", default=".", help="root directory (default: .)")
     p_glob.add_argument("pattern", help="glob pattern (e.g. '**/*.py')")
     p_glob.add_argument("--skip-hidden", action="store_true", help="skip hidden files")
+    p_glob.add_argument("--max-depth", type=int, default=None, help="max recursion depth")
+    add_size_args(p_glob)
+    add_time_args(p_glob)
     p_glob.add_argument("--json", dest="as_json", action="store_true", help="output as JSON")
     p_glob.set_defaults(func=cmd_glob)
 
@@ -279,6 +337,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_index.add_argument("directory", nargs="?", default=".", help="directory to index (default: .)")
     p_index.add_argument("--ext", nargs="+", required=True, help="extensions to index (e.g. .py .pyi .pyc)")
     p_index.add_argument("--skip-hidden", action="store_true", help="skip hidden files")
+    p_index.add_argument("--max-depth", type=int, default=None, help="max recursion depth")
+    add_name_args(p_index)
+    add_size_args(p_index)
+    add_time_args(p_index)
     p_index.add_argument("--json", dest="as_json", action="store_true", help="output as JSON")
     p_index.set_defaults(func=cmd_index)
 
@@ -288,6 +350,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_du.add_argument("--depth", type=int, default=1, help="directory depth for grouping (default: 1)")
     p_du.add_argument("--top", type=int, default=20, help="number of top entries (default: 20)")
     p_du.add_argument("--skip-hidden", action="store_true", help="skip hidden files/dirs")
+    p_du.add_argument("--ext", nargs="+", default=None, help="filter by extensions")
+    add_name_args(p_du)
+    add_size_args(p_du)
+    add_time_args(p_du)
     p_du.add_argument("--json", dest="as_json", action="store_true", help="output as JSON")
     p_du.set_defaults(func=cmd_du)
 

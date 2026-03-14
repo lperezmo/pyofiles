@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "pyofiles"
-version = "0.2.0"
+version = "0.3.0"
 description = "Fast, Rust-powered file operations for Python"
 requires-python = ">=3.9"
 license = "MIT"

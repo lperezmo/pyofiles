@@ -147,6 +147,34 @@ fn check_time_filters(
     true
 }
 
+fn check_size_filters(size: u64, min_bytes: Option<u64>, max_bytes: Option<u64>) -> bool {
+    if let Some(min) = min_bytes {
+        if size < min { return false; }
+    }
+    if let Some(max) = max_bytes {
+        if size > max { return false; }
+    }
+    true
+}
+
+fn check_name_filter(name_lower: &str, names_lower: &Option<Vec<String>>) -> bool {
+    match names_lower {
+        Some(patterns) => patterns.iter().any(|p| name_lower.contains(p)),
+        None => true,
+    }
+}
+
+fn check_ext_filter(name_lower: &str, exts: &Option<Vec<String>>) -> bool {
+    match exts {
+        Some(exts) => exts.iter().any(|e| name_lower.ends_with(e)),
+        None => true,
+    }
+}
+
+fn mb_to_bytes(mb: Option<f64>) -> Option<u64> {
+    mb.map(|v| (v * 1024.0 * 1024.0) as u64)
+}
+
 fn validate_dir(directory: &str) -> PyResult<()> {
     let path = Path::new(directory);
     if !path.exists() {
@@ -189,6 +217,9 @@ fn get_depth_path(path: &Path, base: &Path, target_depth: usize) -> Option<PathB
 ///     extensions: Optional list of extensions to filter by (e.g. [".py", ".rs"]).
 ///     skip_hidden: Skip hidden files and directories.
 ///     max_depth: Maximum recursion depth.
+///     names: Optional list of name substrings to match (case-insensitive, OR logic).
+///     min_size_mb: Minimum file size in megabytes.
+///     max_size_mb: Maximum file size in megabytes.
 ///     modified_after: Only include files modified after this unix timestamp.
 ///     modified_before: Only include files modified before this unix timestamp.
 ///     created_after: Only include files created after this unix timestamp.
@@ -197,13 +228,16 @@ fn get_depth_path(path: &Path, base: &Path, target_depth: usize) -> Option<PathB
 /// Returns:
 ///     List of FileEntry objects (both files and directories).
 #[pyfunction]
-#[pyo3(signature = (directory, extensions=None, skip_hidden=false, max_depth=None, modified_after=None, modified_before=None, created_after=None, created_before=None))]
+#[pyo3(signature = (directory, extensions=None, skip_hidden=false, max_depth=None, names=None, min_size_mb=None, max_size_mb=None, modified_after=None, modified_before=None, created_after=None, created_before=None))]
 fn walk(
     py: Python<'_>,
     directory: String,
     extensions: Option<Vec<String>>,
     skip_hidden: bool,
     max_depth: Option<usize>,
+    names: Option<Vec<String>>,
+    min_size_mb: Option<f64>,
+    max_size_mb: Option<f64>,
     modified_after: Option<f64>,
     modified_before: Option<f64>,
     created_after: Option<f64>,
@@ -218,6 +252,9 @@ fn walk(
         }
 
         let exts: Option<Vec<String>> = extensions.map(|e| normalize_exts(&e));
+        let names_lower: Option<Vec<String>> = names.map(|n| n.iter().map(|s| s.to_lowercase()).collect());
+        let min_bytes = mb_to_bytes(min_size_mb);
+        let max_bytes = mb_to_bytes(max_size_mb);
         let has_time_filters = modified_after.is_some() || modified_before.is_some()
             || created_after.is_some() || created_before.is_some();
 
@@ -230,13 +267,14 @@ fn walk(
                 let is_file = entry.file_type().is_file();
                 let is_dir = entry.file_type().is_dir();
 
-                // Filter files by extension (directories always pass)
+                // File-only filters: extension, name
                 if is_file {
-                    if let Some(ref exts) = exts {
-                        let name_lower = name.to_lowercase();
-                        if !exts.iter().any(|e| name_lower.ends_with(e)) {
-                            return None;
-                        }
+                    let name_lower = name.to_lowercase();
+                    if !check_ext_filter(&name_lower, &exts) {
+                        return None;
+                    }
+                    if !check_name_filter(&name_lower, &names_lower) {
+                        return None;
                     }
                 }
 
@@ -247,11 +285,16 @@ fn walk(
                     0
                 };
 
-                // Time filters (apply to files only, directories always pass)
-                if is_file && has_time_filters {
-                    if let Some(ref meta) = metadata {
-                        if !check_time_filters(meta, modified_after, modified_before, created_after, created_before) {
-                            return None;
+                // File-only filters: size, time
+                if is_file {
+                    if !check_size_filters(size, min_bytes, max_bytes) {
+                        return None;
+                    }
+                    if has_time_filters {
+                        if let Some(ref meta) = metadata {
+                            if !check_time_filters(meta, modified_after, modified_before, created_after, created_before) {
+                                return None;
+                            }
                         }
                     }
                 }
@@ -271,18 +314,43 @@ fn walk(
 ///
 /// Args:
 ///     directory: Path to list.
+///     extensions: Optional list of extensions to filter by.
+///     names: Optional list of name substrings to match (case-insensitive, OR logic).
+///     min_size_mb: Minimum file size in megabytes.
+///     max_size_mb: Maximum file size in megabytes.
+///     skip_hidden: Skip hidden files and directories.
+///     modified_after: Only include files modified after this unix timestamp.
+///     modified_before: Only include files modified before this unix timestamp.
+///     created_after: Only include files created after this unix timestamp.
+///     created_before: Only include files created before this unix timestamp.
 ///
 /// Returns:
 ///     List of FileEntry objects in the directory.
 #[pyfunction]
-#[pyo3(signature = (directory))]
+#[pyo3(signature = (directory, extensions=None, names=None, min_size_mb=None, max_size_mb=None, skip_hidden=false, modified_after=None, modified_before=None, created_after=None, created_before=None))]
 fn list_dir(
     py: Python<'_>,
     directory: String,
+    extensions: Option<Vec<String>>,
+    names: Option<Vec<String>>,
+    min_size_mb: Option<f64>,
+    max_size_mb: Option<f64>,
+    skip_hidden: bool,
+    modified_after: Option<f64>,
+    modified_before: Option<f64>,
+    created_after: Option<f64>,
+    created_before: Option<f64>,
 ) -> PyResult<Vec<FileEntry>> {
     validate_dir(&directory)?;
 
     py.detach(|| {
+        let exts = extensions.map(|e| normalize_exts(&e));
+        let names_lower: Option<Vec<String>> = names.map(|n| n.iter().map(|s| s.to_lowercase()).collect());
+        let min_bytes = mb_to_bytes(min_size_mb);
+        let max_bytes = mb_to_bytes(max_size_mb);
+        let has_time_filters = modified_after.is_some() || modified_before.is_some()
+            || created_after.is_some() || created_before.is_some();
+
         let mut entries = Vec::new();
         let dir = std::fs::read_dir(&directory)
             .map_err(|e| PyOSError::new_err(format!("Cannot read directory: {}", e)))?;
@@ -291,6 +359,12 @@ fn list_dir(
             if let Ok(item) = item {
                 let path = item.path();
                 let name = item.file_name().to_string_lossy().to_string();
+
+                // Skip hidden
+                if skip_hidden && name.starts_with('.') {
+                    continue;
+                }
+
                 let metadata = item.metadata().ok();
                 let is_file = metadata.as_ref().map(|m| m.is_file()).unwrap_or(false);
                 let is_dir = metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false);
@@ -299,6 +373,28 @@ fn list_dir(
                 } else {
                     0
                 };
+
+                // File-only filters
+                if is_file {
+                    let name_lower = name.to_lowercase();
+                    if !check_ext_filter(&name_lower, &exts) {
+                        continue;
+                    }
+                    if !check_name_filter(&name_lower, &names_lower) {
+                        continue;
+                    }
+                    if !check_size_filters(size, min_bytes, max_bytes) {
+                        continue;
+                    }
+                    if has_time_filters {
+                        if let Some(ref meta) = metadata {
+                            if !check_time_filters(meta, modified_after, modified_before, created_after, created_before) {
+                                continue;
+                            }
+                        }
+                    }
+                }
+
                 let modified = metadata.as_ref().and_then(|m| m.modified().ok()).and_then(systemtime_to_epoch);
                 let created = metadata.as_ref().and_then(|m| m.created().ok()).and_then(systemtime_to_epoch);
                 entries.push(make_entry(&path, name, is_file, is_dir, size, modified, created));
@@ -350,11 +446,12 @@ fn find(
     validate_dir(&directory)?;
 
     if names.is_none() && extensions.is_none()
+        && min_size_mb.is_none() && max_size_mb.is_none()
         && modified_after.is_none() && modified_before.is_none()
         && created_after.is_none() && created_before.is_none()
     {
         return Err(PyValueError::new_err(
-            "Must provide at least `names`, `extensions`, or a time filter"
+            "Must provide at least `names`, `extensions`, a size filter, or a time filter"
         ));
     }
 
@@ -368,8 +465,8 @@ fn find(
             names.map(|n| n.iter().map(|s| s.to_lowercase()).collect());
         let exts_lower: Option<Vec<String>> =
             extensions.map(|e| normalize_exts(&e));
-        let min_bytes = min_size_mb.map(|mb| (mb * 1024.0 * 1024.0) as u64);
-        let max_bytes = max_size_mb.map(|mb| (mb * 1024.0 * 1024.0) as u64);
+        let min_bytes = mb_to_bytes(min_size_mb);
+        let max_bytes = mb_to_bytes(max_size_mb);
 
         let entries: Vec<FileEntry> = walker
             .into_iter()
@@ -384,27 +481,20 @@ fn find(
                 let name_lower = name.to_lowercase();
 
                 // Name substring match (any substring matches -> include)
-                if let Some(ref patterns) = names_lower {
-                    if !patterns.iter().any(|p| name_lower.contains(p)) {
-                        return None;
-                    }
+                if !check_name_filter(&name_lower, &names_lower) {
+                    return None;
                 }
 
                 // Extension match
-                if let Some(ref exts) = exts_lower {
-                    if !exts.iter().any(|e| name_lower.ends_with(e)) {
-                        return None;
-                    }
+                if !check_ext_filter(&name_lower, &exts_lower) {
+                    return None;
                 }
 
                 // Size and time filters (single metadata call)
                 let metadata = path.metadata().ok();
                 let size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
-                if let Some(min) = min_bytes {
-                    if size < min { return None; }
-                }
-                if let Some(max) = max_bytes {
-                    if size > max { return None; }
+                if !check_size_filters(size, min_bytes, max_bytes) {
+                    return None;
                 }
 
                 // Time filters
@@ -434,28 +524,74 @@ fn find(
 ///     directory: Root directory to index.
 ///     extensions: Extensions to index (e.g. [".py", ".pyi", ".pyc"]).
 ///     skip_hidden: Skip hidden files.
+///     max_depth: Maximum recursion depth.
+///     names: Optional list of name substrings to match (case-insensitive, OR logic).
+///     min_size_mb: Minimum file size in megabytes.
+///     max_size_mb: Maximum file size in megabytes.
+///     modified_after: Only include files modified after this unix timestamp.
+///     modified_before: Only include files modified before this unix timestamp.
+///     created_after: Only include files created after this unix timestamp.
+///     created_before: Only include files created before this unix timestamp.
 ///
 /// Returns:
 ///     Dict like {"main": {".py": "/src/main.py", ".pyc": "/src/main.pyc"}}
 #[pyfunction]
-#[pyo3(signature = (directory, extensions, skip_hidden=false))]
+#[pyo3(signature = (directory, extensions, skip_hidden=false, max_depth=None, names=None, min_size_mb=None, max_size_mb=None, modified_after=None, modified_before=None, created_after=None, created_before=None))]
 fn index(
     py: Python<'_>,
     directory: String,
     extensions: Vec<String>,
     skip_hidden: bool,
+    max_depth: Option<usize>,
+    names: Option<Vec<String>>,
+    min_size_mb: Option<f64>,
+    max_size_mb: Option<f64>,
+    modified_after: Option<f64>,
+    modified_before: Option<f64>,
+    created_after: Option<f64>,
+    created_before: Option<f64>,
 ) -> PyResult<HashMap<String, HashMap<String, String>>> {
     validate_dir(&directory)?;
 
     py.detach(|| {
         let exts = normalize_exts(&extensions);
+        let names_lower: Option<Vec<String>> = names.map(|n| n.iter().map(|s| s.to_lowercase()).collect());
+        let min_bytes = mb_to_bytes(min_size_mb);
+        let max_bytes = mb_to_bytes(max_size_mb);
+        let has_meta_filters = min_bytes.is_some() || max_bytes.is_some()
+            || modified_after.is_some() || modified_before.is_some()
+            || created_after.is_some() || created_before.is_some();
+
+        let mut walker = WalkDir::new(&directory).skip_hidden(skip_hidden);
+        if let Some(depth) = max_depth {
+            walker = walker.max_depth(depth);
+        }
+
         let mut file_index: HashMap<String, HashMap<String, String>> = HashMap::new();
 
-        for entry in WalkDir::new(&directory).skip_hidden(skip_hidden) {
+        for entry in walker {
             if let Ok(entry) = entry {
                 if entry.file_type().is_file() {
                     let name = entry.file_name().to_string_lossy().to_string();
                     let name_lower = name.to_lowercase();
+
+                    // Name filter
+                    if !check_name_filter(&name_lower, &names_lower) {
+                        continue;
+                    }
+
+                    // Size and time filters (require metadata)
+                    if has_meta_filters {
+                        if let Ok(metadata) = entry.path().metadata() {
+                            let size = metadata.len();
+                            if !check_size_filters(size, min_bytes, max_bytes) {
+                                continue;
+                            }
+                            if !check_time_filters(&metadata, modified_after, modified_before, created_after, created_before) {
+                                continue;
+                            }
+                        }
+                    }
 
                     for ext in &exts {
                         if name_lower.ends_with(ext) {
@@ -481,16 +617,30 @@ fn index(
 ///     directory: Root directory to search.
 ///     pattern: Glob pattern (e.g. "**/*.py", "src/*.rs", "*.{js,ts}").
 ///     skip_hidden: Skip hidden files.
+///     max_depth: Maximum recursion depth.
+///     min_size_mb: Minimum file size in megabytes.
+///     max_size_mb: Maximum file size in megabytes.
+///     modified_after: Only include files modified after this unix timestamp.
+///     modified_before: Only include files modified before this unix timestamp.
+///     created_after: Only include files created after this unix timestamp.
+///     created_before: Only include files created before this unix timestamp.
 ///
 /// Returns:
 ///     List of full paths matching the pattern.
 #[pyfunction]
-#[pyo3(signature = (directory, pattern, skip_hidden=false))]
+#[pyo3(signature = (directory, pattern, skip_hidden=false, max_depth=None, min_size_mb=None, max_size_mb=None, modified_after=None, modified_before=None, created_after=None, created_before=None))]
 fn glob(
     py: Python<'_>,
     directory: String,
     pattern: String,
     skip_hidden: bool,
+    max_depth: Option<usize>,
+    min_size_mb: Option<f64>,
+    max_size_mb: Option<f64>,
+    modified_after: Option<f64>,
+    modified_before: Option<f64>,
+    created_after: Option<f64>,
+    created_before: Option<f64>,
 ) -> PyResult<Vec<String>> {
     validate_dir(&directory)?;
 
@@ -500,9 +650,18 @@ fn glob(
             .compile_matcher();
 
         let base = Path::new(&directory);
+        let min_bytes = mb_to_bytes(min_size_mb);
+        let max_bytes = mb_to_bytes(max_size_mb);
+        let has_meta_filters = min_bytes.is_some() || max_bytes.is_some()
+            || modified_after.is_some() || modified_before.is_some()
+            || created_after.is_some() || created_before.is_some();
 
-        let paths: Vec<String> = WalkDir::new(&directory)
-            .skip_hidden(skip_hidden)
+        let mut walker = WalkDir::new(&directory).skip_hidden(skip_hidden);
+        if let Some(depth) = max_depth {
+            walker = walker.max_depth(depth);
+        }
+
+        let paths: Vec<String> = walker
             .into_iter()
             .filter_map(|entry| {
                 let entry = entry.ok()?;
@@ -513,11 +672,23 @@ fn glob(
                 let relative = path.strip_prefix(base).ok()?;
                 // Normalize separators for cross-platform glob matching
                 let rel_str = relative.to_string_lossy().replace('\\', "/");
-                if matcher.is_match(&rel_str) {
-                    Some(path.to_string_lossy().to_string())
-                } else {
-                    None
+                if !matcher.is_match(&rel_str) {
+                    return None;
                 }
+
+                // Size and time filters
+                if has_meta_filters {
+                    let metadata = path.metadata().ok()?;
+                    let size = metadata.len();
+                    if !check_size_filters(size, min_bytes, max_bytes) {
+                        return None;
+                    }
+                    if !check_time_filters(&metadata, modified_after, modified_before, created_after, created_before) {
+                        return None;
+                    }
+                }
+
+                Some(path.to_string_lossy().to_string())
             })
             .collect();
 
@@ -535,22 +706,45 @@ fn glob(
 ///     depth: Directory depth for grouping (default: 1).
 ///     top: Number of top entries to return (default: 20).
 ///     skip_hidden: Skip hidden files and directories.
+///     extensions: Optional list of extensions to filter by.
+///     names: Optional list of name substrings to match (case-insensitive, OR logic).
+///     min_size_mb: Minimum file size in megabytes.
+///     max_size_mb: Maximum file size in megabytes.
+///     modified_after: Only include files modified after this unix timestamp.
+///     modified_before: Only include files modified before this unix timestamp.
+///     created_after: Only include files created after this unix timestamp.
+///     created_before: Only include files created before this unix timestamp.
 ///
 /// Returns:
 ///     DiskUsage object with .entries, .total_size, .total_files, .total_size_mb, .total_size_gb.
 #[pyfunction]
-#[pyo3(signature = (directory, depth=1, top=20, skip_hidden=false))]
+#[pyo3(signature = (directory, depth=1, top=20, skip_hidden=false, extensions=None, names=None, min_size_mb=None, max_size_mb=None, modified_after=None, modified_before=None, created_after=None, created_before=None))]
 fn disk_usage(
     py: Python<'_>,
     directory: String,
     depth: usize,
     top: usize,
     skip_hidden: bool,
+    extensions: Option<Vec<String>>,
+    names: Option<Vec<String>>,
+    min_size_mb: Option<f64>,
+    max_size_mb: Option<f64>,
+    modified_after: Option<f64>,
+    modified_before: Option<f64>,
+    created_after: Option<f64>,
+    created_before: Option<f64>,
 ) -> PyResult<DiskUsage> {
     validate_dir(&directory)?;
 
     py.detach(|| {
         let base = Path::new(&directory);
+        let exts = extensions.map(|e| normalize_exts(&e));
+        let names_lower: Option<Vec<String>> = names.map(|n| n.iter().map(|s| s.to_lowercase()).collect());
+        let min_bytes = mb_to_bytes(min_size_mb);
+        let max_bytes = mb_to_bytes(max_size_mb);
+        let has_time_filters = modified_after.is_some() || modified_before.is_some()
+            || created_after.is_some() || created_before.is_some();
+
         let mut folder_sizes: HashMap<String, (u64, usize)> = HashMap::new();
         let mut total_size: u64 = 0;
         let mut total_files: usize = 0;
@@ -559,7 +753,36 @@ fn disk_usage(
             if let Ok(entry) = entry {
                 if entry.file_type().is_file() {
                     let path = entry.path();
-                    let size = path.metadata().map(|m| m.len()).unwrap_or(0);
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    let name_lower = name.to_lowercase();
+
+                    // Extension filter
+                    if !check_ext_filter(&name_lower, &exts) {
+                        continue;
+                    }
+
+                    // Name filter
+                    if !check_name_filter(&name_lower, &names_lower) {
+                        continue;
+                    }
+
+                    let metadata = path.metadata().ok();
+                    let size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
+
+                    // Size filter
+                    if !check_size_filters(size, min_bytes, max_bytes) {
+                        continue;
+                    }
+
+                    // Time filter
+                    if has_time_filters {
+                        if let Some(ref meta) = metadata {
+                            if !check_time_filters(meta, modified_after, modified_before, created_after, created_before) {
+                                continue;
+                            }
+                        }
+                    }
+
                     total_size += size;
                     total_files += 1;
 
