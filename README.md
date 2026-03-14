@@ -1,3 +1,14 @@
+<div align="center">
+  <img src="https://raw.githubusercontent.com/lperezmo/pyofiles/master/icons/pyofiles_logo.svg" alt="pyofiles logo" width="400">
+  <br><br>
+
+  <a href="https://github.com/lperezmo/pyofiles/actions/workflows/ci.yml"><img src="https://github.com/lperezmo/pyofiles/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://pypi.org/project/pyofiles/"><img src="https://img.shields.io/pypi/v/pyofiles" alt="PyPI version"></a>
+  <a href="https://pypistats.org/packages/pyofiles"><img src="https://img.shields.io/pypi/dm/pyofiles" alt="Downloads"></a>
+  <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-%E2%89%A53.9-blue" alt="Python ≥3.9"></a>
+  <a href="https://github.com/lperezmo/pyofiles/blob/master/LICENSE"><img src="https://img.shields.io/github/license/lperezmo/pyofiles" alt="License"></a>
+</div>
+
 # pyofiles
 
 Fast, Rust-powered file operations for Python. Drop-in replacements for `os.walk`, `os.listdir`, and `glob.glob` -- built on parallel directory walkers for maximum speed.
