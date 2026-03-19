@@ -284,6 +284,10 @@ def build_parser() -> argparse.ArgumentParser:
         prog="pyofiles",
         description="Fast, Rust-powered file operations.",
     )
+    parser.add_argument(
+        "-v", "--version", action="version",
+        version=f"%(prog)s {pyofiles.__version__}",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     # -- walk --
