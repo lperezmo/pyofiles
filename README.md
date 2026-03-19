@@ -39,6 +39,20 @@ Or install globally with `uv tool`:
 uv tool install pyofiles
 ```
 
+### Version
+
+```bash
+pyofiles --version
+pyofiles -v
+```
+
+You can also check the version from Python:
+
+```python
+import pyofiles
+print(pyofiles.__version__)
+```
+
 ### Examples
 
 ```bash
