@@ -3,7 +3,15 @@
 
 ## v0.4.0 (2026-03-19)
 
+### Bug Fixes
+
+- Release workflow for publishing to pypi, and update readme with new version flag.
+  ([`f6fd3ba`](https://github.com/lperezmo/pyofiles/commit/f6fd3ba2043521219c62e1e421f35b06b09b5bd5))
+
 ### Continuous Integration
+
+- Add semantic release workflow with auto version bumping
+  ([`83eda39`](https://github.com/lperezmo/pyofiles/commit/83eda399c8ab5311cb9586e6dadc7857b9e55d04))
 
 - Add semantic release workflow with auto version bumping
   ([`b23227e`](https://github.com/lperezmo/pyofiles/commit/b23227e06c38466ee470afc27659c809655e3841))
