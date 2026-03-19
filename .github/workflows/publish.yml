@@ -1,8 +1,11 @@
-name: Publish to PyPI
+name: Publish to PyPI (Manual)
 
+# Fallback for manual tag-based releases.
+# Automated releases are handled by release.yml via python-semantic-release.
 on:
-  release:
-    types: [published]
+  push:
+    tags: ['v*']
+  workflow_dispatch:
 
 permissions:
   contents: read
