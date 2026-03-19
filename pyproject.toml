@@ -27,6 +27,14 @@ pyofiles = "pyofiles.cli:main"
 features = ["pyo3/extension-module"]
 python-source = "python"
 
+[tool.semantic_release]
+version_toml = [
+    "pyproject.toml:project.version",
+    "Cargo.toml:package.version",
+]
+tag_format = "v{version}"
+commit_message = "chore(release): v{version}"
+
 [dependency-groups]
 dev = [
     "maturin>=1.12.6",
