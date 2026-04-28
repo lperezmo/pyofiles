@@ -1,6 +1,25 @@
 # CHANGELOG
 
 
+## v0.5.0 (2026-04-28)
+
+### Features
+
+- Parallelize disk_usage and tune release profile for max throughput
+  ([`c776450`](https://github.com/lperezmo/pyofiles/commit/c7764503cdbecca14489e8fc4d3040572364d821))
+
+Rewrite disk_usage on top of ignore::WalkBuilder::build_parallel with DashMap + atomic aggregation,
+  mirroring the RustSizer architecture. Per-file metadata calls now run on N worker threads instead
+  of serialized through the main thread, eliminating the single-consumer bottleneck that made
+  `pyofiles du` slow on large trees.
+
+Also enable LTO=fat, codegen-units=1, opt-level=3, panic=abort, strip in [profile.release], which
+  benefits every function in the crate.
+
+No API change; behavior is preserved (gitignore is explicitly disabled so disk_usage continues to
+  count every file).
+
+
 ## v0.4.0 (2026-03-19)
 
 ### Bug Fixes
