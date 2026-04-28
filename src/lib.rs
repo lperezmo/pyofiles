@@ -2,9 +2,14 @@ use pyo3::prelude::*;
 use pyo3::exceptions::{PyOSError, PyValueError};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 use jwalk::WalkDir;
 use globset::Glob as GlobPattern;
+use ignore::WalkBuilder;
+use dashmap::DashMap;
 
 // ─── Data Types ─────────────────────────────────────────────
 
@@ -737,7 +742,7 @@ fn disk_usage(
     validate_dir(&directory)?;
 
     py.detach(|| {
-        let base = Path::new(&directory);
+        let base = Arc::new(PathBuf::from(&directory));
         let exts = extensions.map(|e| normalize_exts(&e));
         let names_lower: Option<Vec<String>> = names.map(|n| n.iter().map(|s| s.to_lowercase()).collect());
         let min_bytes = mb_to_bytes(min_size_mb);
@@ -745,63 +750,89 @@ fn disk_usage(
         let has_time_filters = modified_after.is_some() || modified_before.is_some()
             || created_after.is_some() || created_before.is_some();
 
-        let mut folder_sizes: HashMap<String, (u64, usize)> = HashMap::new();
-        let mut total_size: u64 = 0;
-        let mut total_files: usize = 0;
+        let folder_sizes: Arc<DashMap<PathBuf, (AtomicU64, AtomicUsize)>> = Arc::new(DashMap::new());
+        let total_size = Arc::new(AtomicU64::new(0));
+        let total_files = Arc::new(AtomicUsize::new(0));
 
-        for entry in WalkDir::new(&directory).skip_hidden(skip_hidden) {
-            if let Ok(entry) = entry {
-                if entry.file_type().is_file() {
-                    let path = entry.path();
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    let name_lower = name.to_lowercase();
+        let threads = thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
 
-                    // Extension filter
-                    if !check_ext_filter(&name_lower, &exts) {
-                        continue;
-                    }
+        let walker = WalkBuilder::new(base.as_path())
+            .follow_links(false)
+            .hidden(skip_hidden)
+            .git_ignore(false)
+            .git_global(false)
+            .git_exclude(false)
+            .ignore(false)
+            .parents(false)
+            .threads(threads)
+            .build_parallel();
 
-                    // Name filter
-                    if !check_name_filter(&name_lower, &names_lower) {
-                        continue;
-                    }
+        walker.run(|| {
+            let folder_sizes = Arc::clone(&folder_sizes);
+            let total_size = Arc::clone(&total_size);
+            let total_files = Arc::clone(&total_files);
+            let base = Arc::clone(&base);
+            let exts = exts.clone();
+            let names_lower = names_lower.clone();
 
-                    let metadata = path.metadata().ok();
-                    let size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
+            Box::new(move |entry| {
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(_) => return ignore::WalkState::Continue,
+                };
 
-                    // Size filter
-                    if !check_size_filters(size, min_bytes, max_bytes) {
-                        continue;
-                    }
+                let is_file = entry.file_type().map(|ft| ft.is_file()).unwrap_or(false);
+                if !is_file {
+                    return ignore::WalkState::Continue;
+                }
 
-                    // Time filter
-                    if has_time_filters {
-                        if let Some(ref meta) = metadata {
-                            if !check_time_filters(meta, modified_after, modified_before, created_after, created_before) {
-                                continue;
-                            }
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().to_string();
+                let name_lower = name.to_lowercase();
+
+                if !check_ext_filter(&name_lower, &exts) {
+                    return ignore::WalkState::Continue;
+                }
+                if !check_name_filter(&name_lower, &names_lower) {
+                    return ignore::WalkState::Continue;
+                }
+
+                let metadata = entry.metadata().ok();
+                let size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
+
+                if !check_size_filters(size, min_bytes, max_bytes) {
+                    return ignore::WalkState::Continue;
+                }
+
+                if has_time_filters {
+                    if let Some(ref meta) = metadata {
+                        if !check_time_filters(meta, modified_after, modified_before, created_after, created_before) {
+                            return ignore::WalkState::Continue;
                         }
                     }
-
-                    total_size += size;
-                    total_files += 1;
-
-                    if let Some(bucket) = get_depth_path(&path, base, depth) {
-                        let key = bucket.to_string_lossy().to_string();
-                        let counter = folder_sizes.entry(key).or_insert((0, 0));
-                        counter.0 += size;
-                        counter.1 += 1;
-                    }
                 }
-            }
-        }
+
+                total_size.fetch_add(size, Ordering::Relaxed);
+                total_files.fetch_add(1, Ordering::Relaxed);
+
+                if let Some(bucket) = get_depth_path(path, base.as_path(), depth) {
+                    let counter = folder_sizes
+                        .entry(bucket)
+                        .or_insert_with(|| (AtomicU64::new(0), AtomicUsize::new(0)));
+                    counter.value().0.fetch_add(size, Ordering::Relaxed);
+                    counter.value().1.fetch_add(1, Ordering::Relaxed);
+                }
+
+                ignore::WalkState::Continue
+            })
+        });
 
         let mut entries: Vec<SizeEntry> = folder_sizes
-            .into_iter()
-            .map(|(path, (size, count))| SizeEntry {
-                path,
-                size,
-                file_count: count,
+            .iter()
+            .map(|e| SizeEntry {
+                path: e.key().to_string_lossy().to_string(),
+                size: e.value().0.load(Ordering::Relaxed),
+                file_count: e.value().1.load(Ordering::Relaxed),
             })
             .collect();
 
@@ -809,8 +840,8 @@ fn disk_usage(
         entries.truncate(top);
 
         Ok(DiskUsage {
-            total_size,
-            total_files,
+            total_size: total_size.load(Ordering::Relaxed),
+            total_files: total_files.load(Ordering::Relaxed),
             entries_vec: entries,
         })
     })
