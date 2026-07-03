@@ -11,6 +11,14 @@ use dashmap::DashMap;
 use globset::Glob as GlobPattern;
 use ignore::{WalkBuilder, WalkState};
 
+#[cfg(windows)]
+mod mft;
+
+#[cfg(not(windows))]
+fn mft_unavailable() -> PyErr {
+    PyValueError::new_err("mft=True is only available on Windows")
+}
+
 // ─── Data Types ─────────────────────────────────────────────
 
 /// A file or directory entry returned by walk/find/list_dir.
@@ -300,6 +308,32 @@ impl Filters {
         true
     }
 
+    /// Size and time checks against values that are already known (the
+    /// MFT backend), mirroring `matches_metadata` semantics: a missing
+    /// timestamp fails any active filter on it.
+    #[cfg(windows)]
+    fn matches_values(&self, size: u64, modified: Option<f64>, created: Option<f64>) -> bool {
+        if !self.has_meta_filters() {
+            return true;
+        }
+        if !check_size_filters(size, self.min_bytes, self.max_bytes) {
+            return false;
+        }
+        if let Some(after) = self.modified_after {
+            if modified.unwrap_or(0.0) < after { return false; }
+        }
+        if let Some(before) = self.modified_before {
+            if modified.unwrap_or(f64::MAX) > before { return false; }
+        }
+        if let Some(after) = self.created_after {
+            if created.unwrap_or(0.0) < after { return false; }
+        }
+        if let Some(before) = self.created_before {
+            if created.unwrap_or(f64::MAX) > before { return false; }
+        }
+        true
+    }
+
     fn matches_metadata(&self, metadata: Option<&std::fs::Metadata>) -> bool {
         if !self.has_meta_filters() {
             return true;
@@ -331,6 +365,138 @@ fn build_walker(directory: &Path, skip_hidden: bool, max_depth: Option<usize>, t
         .build_parallel()
 }
 
+// ─── MFT backend consumers (Windows only) ───────────────────
+
+#[cfg(windows)]
+fn mft_file_entry(entry: mft::MftEntry) -> FileEntry {
+    let mft::MftEntry { path, name, is_dir, size, modified, created, .. } = entry;
+    let size = if is_dir { 0 } else { size };
+    make_entry(Path::new(&path), name, !is_dir, is_dir, size, modified, created)
+}
+
+/// Same shape as `walk`: with any filter set, matching files only;
+/// without filters, files and directories.
+#[cfg(windows)]
+fn mft_walk_entries(
+    scan: mft::MftScan,
+    filters: &Filters,
+    skip_hidden: bool,
+    max_depth: Option<usize>,
+) -> Vec<FileEntry> {
+    let include_non_files = !filters.has_any();
+    let mut out = Vec::new();
+    for entry in scan.entries {
+        if skip_hidden && entry.hidden {
+            continue;
+        }
+        if let Some(depth) = max_depth {
+            if entry.depth > depth {
+                continue;
+            }
+        }
+        if entry.is_dir {
+            if include_non_files {
+                out.push(mft_file_entry(entry));
+            }
+            continue;
+        }
+        if !filters.matches_name(&entry.name) {
+            continue;
+        }
+        if !filters.matches_values(entry.size, entry.modified, entry.created) {
+            continue;
+        }
+        out.push(mft_file_entry(entry));
+    }
+    out
+}
+
+/// Same shape as `find`: matching files only, `limit` honored.
+#[cfg(windows)]
+fn mft_find_entries(
+    scan: mft::MftScan,
+    filters: &Filters,
+    skip_hidden: bool,
+    max_depth: Option<usize>,
+    limit: Option<usize>,
+) -> Vec<FileEntry> {
+    let mut out = Vec::new();
+    for entry in scan.entries {
+        if let Some(lim) = limit {
+            if out.len() >= lim {
+                break;
+            }
+        }
+        if entry.is_dir || (skip_hidden && entry.hidden) {
+            continue;
+        }
+        if let Some(depth) = max_depth {
+            if entry.depth > depth {
+                continue;
+            }
+        }
+        if !filters.matches_name(&entry.name) {
+            continue;
+        }
+        if !filters.matches_values(entry.size, entry.modified, entry.created) {
+            continue;
+        }
+        out.push(mft_file_entry(entry));
+    }
+    out
+}
+
+/// Same aggregation as `disk_usage`: depth buckets sorted by size.
+#[cfg(windows)]
+fn mft_disk_usage(
+    scan: mft::MftScan,
+    filters: &Filters,
+    skip_hidden: bool,
+    depth: usize,
+    top: usize,
+) -> DiskUsage {
+    let base = PathBuf::from(&scan.root);
+    let mut folder_sizes: HashMap<PathBuf, (u64, usize)> = HashMap::new();
+    let mut total_size = 0u64;
+    let mut total_files = 0usize;
+
+    for entry in &scan.entries {
+        if entry.is_dir || (skip_hidden && entry.hidden) {
+            continue;
+        }
+        if !filters.matches_name(&entry.name) {
+            continue;
+        }
+        if !filters.matches_values(entry.size, entry.modified, entry.created) {
+            continue;
+        }
+        total_size += entry.size;
+        total_files += 1;
+        if let Some(bucket) = get_depth_path(Path::new(&entry.path), &base, depth) {
+            let counter = folder_sizes.entry(bucket).or_insert((0, 0));
+            counter.0 += entry.size;
+            counter.1 += 1;
+        }
+    }
+
+    let mut entries: Vec<SizeEntry> = folder_sizes
+        .into_iter()
+        .map(|(path, (size, file_count))| SizeEntry {
+            path: path.to_string_lossy().to_string(),
+            size,
+            file_count,
+        })
+        .collect();
+    entries.sort_by_key(|e| std::cmp::Reverse(e.size));
+    entries.truncate(top);
+
+    DiskUsage {
+        total_size,
+        total_files,
+        entries_vec: entries,
+    }
+}
+
 // ─── Functions ──────────────────────────────────────────────
 
 /// Recursively walk a directory in parallel, returning all entries.
@@ -352,11 +518,14 @@ fn build_walker(directory: &Path, skip_hidden: bool, max_depth: Option<usize>, t
 ///     created_after: Only include files created after this unix timestamp.
 ///     created_before: Only include files created before this unix timestamp.
 ///     threads: Number of walker threads (default: number of CPUs).
+///     mft: Windows only. Read the volume's NTFS Master File Table
+///         directly instead of walking directories (requires administrator
+///         privileges and a local NTFS volume).
 ///
 /// Returns:
 ///     List of FileEntry objects.
 #[pyfunction]
-#[pyo3(signature = (directory, extensions=None, skip_hidden=false, max_depth=None, names=None, min_size_mb=None, max_size_mb=None, modified_after=None, modified_before=None, created_after=None, created_before=None, threads=None))]
+#[pyo3(signature = (directory, extensions=None, skip_hidden=false, max_depth=None, names=None, min_size_mb=None, max_size_mb=None, modified_after=None, modified_before=None, created_after=None, created_before=None, threads=None, mft=false))]
 #[allow(clippy::too_many_arguments)]
 fn walk(
     py: Python<'_>,
@@ -372,9 +541,21 @@ fn walk(
     created_after: Option<f64>,
     created_before: Option<f64>,
     threads: Option<usize>,
+    mft: bool,
 ) -> PyResult<Vec<FileEntry>> {
-    validate_dir(&directory)?;
     let filters = Filters::new(extensions, names, min_size_mb, max_size_mb, modified_after, modified_before, created_after, created_before);
+
+    if mft {
+        #[cfg(windows)]
+        return py.detach(|| {
+            let scan = mft::scan(&directory, default_threads(threads))?;
+            Ok(mft_walk_entries(scan, &filters, skip_hidden, max_depth))
+        });
+        #[cfg(not(windows))]
+        return Err(mft_unavailable());
+    }
+
+    validate_dir(&directory)?;
 
     py.detach(|| {
         let include_non_files = !filters.has_any();
@@ -520,6 +701,9 @@ fn list_dir(
 ///     limit: Stop searching once this many matches are found. Which
 ///         matches are returned when the limit truncates is unspecified.
 ///     threads: Number of walker threads (default: number of CPUs).
+///     mft: Windows only. Read the volume's NTFS Master File Table
+///         directly instead of walking directories (requires administrator
+///         privileges and a local NTFS volume).
 ///
 /// Returns:
 ///     List of matching FileEntry objects (files only).
@@ -527,7 +711,7 @@ fn list_dir(
 /// Example:
 ///     find("/data", names=["report", "summary"], extensions=[".pdf", ".docx"])
 #[pyfunction]
-#[pyo3(signature = (directory, names=None, extensions=None, min_size_mb=None, max_size_mb=None, skip_hidden=false, max_depth=None, modified_after=None, modified_before=None, created_after=None, created_before=None, limit=None, threads=None))]
+#[pyo3(signature = (directory, names=None, extensions=None, min_size_mb=None, max_size_mb=None, skip_hidden=false, max_depth=None, modified_after=None, modified_before=None, created_after=None, created_before=None, limit=None, threads=None, mft=false))]
 #[allow(clippy::too_many_arguments)]
 fn find(
     py: Python<'_>,
@@ -544,9 +728,31 @@ fn find(
     created_before: Option<f64>,
     limit: Option<usize>,
     threads: Option<usize>,
+    mft: bool,
 ) -> PyResult<Vec<FileEntry>> {
-    validate_dir(&directory)?;
     let filters = Filters::new(extensions, names, min_size_mb, max_size_mb, modified_after, modified_before, created_after, created_before);
+
+    if mft {
+        #[cfg(windows)]
+        {
+            if !filters.has_any() {
+                return Err(PyValueError::new_err(
+                    "Must provide at least `names`, `extensions`, a size filter, or a time filter"
+                ));
+            }
+            if limit == Some(0) {
+                return Ok(Vec::new());
+            }
+            return py.detach(|| {
+                let scan = mft::scan(&directory, default_threads(threads))?;
+                Ok(mft_find_entries(scan, &filters, skip_hidden, max_depth, limit))
+            });
+        }
+        #[cfg(not(windows))]
+        return Err(mft_unavailable());
+    }
+
+    validate_dir(&directory)?;
 
     if !filters.has_any() {
         return Err(PyValueError::new_err(
@@ -863,11 +1069,14 @@ fn glob(
 ///     created_after: Only include files created after this unix timestamp.
 ///     created_before: Only include files created before this unix timestamp.
 ///     threads: Number of walker threads (default: number of CPUs).
+///     mft: Windows only. Read the volume's NTFS Master File Table
+///         directly instead of walking directories (requires administrator
+///         privileges and a local NTFS volume).
 ///
 /// Returns:
 ///     DiskUsage object with .entries, .total_size, .total_files, .total_size_mb, .total_size_gb.
 #[pyfunction]
-#[pyo3(signature = (directory, depth=1, top=20, skip_hidden=false, extensions=None, names=None, min_size_mb=None, max_size_mb=None, modified_after=None, modified_before=None, created_after=None, created_before=None, threads=None))]
+#[pyo3(signature = (directory, depth=1, top=20, skip_hidden=false, extensions=None, names=None, min_size_mb=None, max_size_mb=None, modified_after=None, modified_before=None, created_after=None, created_before=None, threads=None, mft=false))]
 #[allow(clippy::too_many_arguments)]
 fn disk_usage(
     py: Python<'_>,
@@ -884,9 +1093,21 @@ fn disk_usage(
     created_after: Option<f64>,
     created_before: Option<f64>,
     threads: Option<usize>,
+    mft: bool,
 ) -> PyResult<DiskUsage> {
-    validate_dir(&directory)?;
     let filters = Filters::new(extensions, names, min_size_mb, max_size_mb, modified_after, modified_before, created_after, created_before);
+
+    if mft {
+        #[cfg(windows)]
+        return py.detach(|| {
+            let scan = mft::scan(&directory, default_threads(threads))?;
+            Ok(mft_disk_usage(scan, &filters, skip_hidden, depth, top))
+        });
+        #[cfg(not(windows))]
+        return Err(mft_unavailable());
+    }
+
+    validate_dir(&directory)?;
 
     py.detach(|| {
         let base = Arc::new(PathBuf::from(&directory));

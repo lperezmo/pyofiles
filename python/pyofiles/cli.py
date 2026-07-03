@@ -184,6 +184,13 @@ def add_threads_arg(parser: argparse.ArgumentParser):
                         help="number of walker threads (default: number of CPUs)")
 
 
+def add_mft_arg(parser: argparse.ArgumentParser):
+    """Add the NTFS MFT fast path flag to a subparser."""
+    parser.add_argument("--mft", action="store_true",
+                        help="scan the NTFS Master File Table directly "
+                             "(Windows only; needs admin and a local NTFS volume)")
+
+
 # ---------------------------------------------------------------------------
 # Subcommands
 # ---------------------------------------------------------------------------
@@ -202,6 +209,7 @@ def cmd_walk(args):
         created_after=args.created_after,
         created_before=args.created_before,
         threads=args.threads,
+        mft=args.mft,
     )
     print_entries(entries, as_json=args.as_json, long=args.long)
 
@@ -221,6 +229,7 @@ def cmd_find(args):
         created_before=args.created_before,
         limit=args.limit,
         threads=args.threads,
+        mft=args.mft,
     )
     print_entries(entries, as_json=args.as_json, long=args.long)
 
@@ -301,6 +310,7 @@ def cmd_du(args):
         created_after=args.created_after,
         created_before=args.created_before,
         threads=args.threads,
+        mft=args.mft,
     )
     print_disk_usage(usage, as_json=args.as_json)
 
@@ -330,6 +340,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_size_args(p_walk)
     add_time_args(p_walk)
     add_threads_arg(p_walk)
+    add_mft_arg(p_walk)
     add_output_args(p_walk)
     p_walk.set_defaults(func=cmd_walk)
 
@@ -345,6 +356,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_size_args(p_find)
     add_time_args(p_find)
     add_threads_arg(p_find)
+    add_mft_arg(p_find)
     add_output_args(p_find)
     p_find.set_defaults(func=cmd_find)
 
@@ -395,6 +407,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_size_args(p_du)
     add_time_args(p_du)
     add_threads_arg(p_du)
+    add_mft_arg(p_du)
     p_du.add_argument("--json", dest="as_json", action="store_true", help="output as JSON")
     p_du.set_defaults(func=cmd_du)
 

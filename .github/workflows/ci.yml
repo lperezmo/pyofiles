@@ -40,3 +40,44 @@ jobs:
           pyofiles du . --top 3 --threads 2
           pyofiles find . --ext .rs --json
         shell: bash
+      # GitHub windows runners are elevated, so the real MFT path can be
+      # exercised against the NTFS system volume. The workspace itself may
+      # live on a ReFS Dev Drive, hence the fixed C:\ target directory.
+      - name: MFT fast path smoke test (Windows, elevated)
+        if: runner.os == 'Windows'
+        run: |
+          python - <<'EOF'
+          import pyofiles
+
+          target = 'C:\\Windows\\System32\\drivers'
+          usage = pyofiles.disk_usage(target, mft=True)
+          assert usage.total_files > 0, usage
+
+          found = pyofiles.find(target, extensions=['.sys'], mft=True, limit=5)
+          assert 0 < len(found) <= 5, len(found)
+          assert all(f.name.lower().endswith('.sys') for f in found), found
+          assert all(f.size >= 0 and f.modified for f in found), found
+
+          # Loose agreement with the walk backend on a stable directory.
+          walk_usage = pyofiles.disk_usage(target)
+          lo, hi = sorted([usage.total_files, walk_usage.total_files])
+          assert hi <= lo * 1.10, (usage.total_files, walk_usage.total_files)
+          print(f'MFT OK: mft={usage.total_files} walk={walk_usage.total_files} '
+                f'files, {usage.total_size_mb:.1f} MB')
+          EOF
+          pyofiles du 'C:\Windows\System32\drivers' --mft --top 3
+        shell: bash
+      - name: MFT unavailable off Windows
+        if: runner.os == 'Linux'
+        run: |
+          python - <<'EOF'
+          import pyofiles
+          try:
+              pyofiles.disk_usage('.', mft=True)
+          except ValueError as e:
+              assert 'only available on Windows' in str(e), e
+              print('non-Windows mft=True ValueError OK')
+          else:
+              raise AssertionError('expected ValueError from mft=True')
+          EOF
+        shell: bash

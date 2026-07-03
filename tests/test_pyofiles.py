@@ -521,6 +521,77 @@ def test_list_dir_sorted():
     check("list_dir returns sorted names", names == sorted(names), f"names={names}")
 
 
+def _is_windows_admin():
+    """True when running elevated on Windows (e.g. GitHub windows runners)."""
+    if sys.platform != "win32":
+        return False
+    import ctypes
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin() != 0
+    except Exception:
+        return False
+
+
+def test_mft():
+    section("mft fast path")
+    root = str(FIXTURES)
+
+    calls = [
+        ("disk_usage", lambda: pyofiles.disk_usage(root, mft=True)),
+        ("walk", lambda: pyofiles.walk(root, mft=True)),
+        ("find", lambda: pyofiles.find(root, names=["readme"], mft=True)),
+    ]
+
+    if sys.platform != "win32":
+        # mft=True must raise ValueError on non-Windows builds.
+        for label, call in calls:
+            try:
+                call()
+                check(f"{label} mft=True raises on non-Windows", False, "no exception")
+            except ValueError as e:
+                check(f"{label} mft=True raises ValueError on non-Windows",
+                      "only available on Windows" in str(e), f"msg={e}")
+            except Exception as e:
+                check(f"{label} mft=True raises ValueError on non-Windows", False,
+                      f"wrong exception {type(e).__name__}: {e}")
+        return
+
+    # Windows: UNC and network paths are rejected regardless of elevation,
+    # even when the share does not exist.
+    try:
+        pyofiles.find(r"\\localhost\nonexistent\share", names=["x"], mft=True)
+        check("find mft=True rejects UNC path", False, "no exception")
+    except OSError as e:
+        msg = str(e)
+        check("find mft=True rejects UNC path with OSError", True)
+        check("UNC error states the requirements",
+              "administrator" in msg and "NTFS" in msg, f"msg={msg}")
+    except Exception as e:
+        check("find mft=True rejects UNC path with OSError", False,
+              f"wrong exception {type(e).__name__}: {e}")
+
+    if _is_windows_admin():
+        # The unprivileged error path cannot be exercised from an elevated
+        # shell; CI covers the real scan in a dedicated workflow step.
+        print("  SKIP  non-admin mft error tests (running elevated)")
+        return
+
+    # Without elevation, opening the raw volume must fail with a clear
+    # OSError that tells the user what is needed.
+    for label, call in calls:
+        try:
+            call()
+            check(f"{label} mft=True raises without admin", False, "no exception")
+        except OSError as e:
+            msg = str(e)
+            check(f"{label} mft=True raises OSError without admin", True)
+            check(f"{label} error mentions administrator",
+                  "administrator" in msg, f"msg={msg}")
+        except Exception as e:
+            check(f"{label} mft=True raises OSError without admin", False,
+                  f"wrong exception {type(e).__name__}: {e}")
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -545,6 +616,7 @@ def main():
         test_find_size_only()
         test_index_collisions()
         test_list_dir_sorted()
+        test_mft()
     finally:
         teardown_fixtures()
 

@@ -102,6 +102,11 @@ pyofiles du ./project --depth 2 --top 10
 pyofiles du ./project --ext .py --modified-after 30d
 pyofiles du ./project --names test --ext .py
 
+# NTFS MFT fast path (Windows, elevated shell, local NTFS volume)
+pyofiles du C:\ --mft --depth 2 --top 20
+pyofiles find C:\Users --mft --ext .mp4 --min-size 500
+pyofiles walk C:\projects --mft --ext .py
+
 # JSON output (works with all commands, pipe to jq)
 pyofiles find ./src --ext .py --json
 pyofiles du . --json | jq '.entries[:5]'
@@ -132,10 +137,11 @@ All filters are available across commands where they make sense:
 | time filters | yes | yes | yes | yes | yes | yes |
 | `--limit` | — | yes | — | — | — | — |
 | `--threads` | yes | yes | — | yes | yes | yes |
+| `--mft` | yes | yes | no | no | no | yes |
 
 ## Python API
 
-### `walk(directory, extensions=None, skip_hidden=False, max_depth=None, names=None, min_size_mb=None, max_size_mb=None, modified_after=None, modified_before=None, created_after=None, created_before=None, threads=None)`
+### `walk(directory, extensions=None, skip_hidden=False, max_depth=None, names=None, min_size_mb=None, max_size_mb=None, modified_after=None, modified_before=None, created_after=None, created_before=None, threads=None, mft=False)`
 Parallel recursive directory walk. Returns `list[FileEntry]`.
 
 When any filter is given, only matching files are returned; directories are
@@ -162,7 +168,7 @@ for e in entries:
         print(f"{e.name} ({e.size} bytes)")
 ```
 
-### `find(directory, names=None, extensions=None, min_size_mb=None, max_size_mb=None, skip_hidden=False, max_depth=None, modified_after=None, modified_before=None, created_after=None, created_before=None, limit=None, threads=None)`
+### `find(directory, names=None, extensions=None, min_size_mb=None, max_size_mb=None, skip_hidden=False, max_depth=None, modified_after=None, modified_before=None, created_after=None, created_before=None, limit=None, threads=None, mft=False)`
 Search for files by name substrings, extensions, size, and time. Accepts **multiple substrings** -- a file matches if its name contains ANY of them (case-insensitive).
 
 `limit=N` stops the search as soon as N matches are found, which makes
@@ -241,7 +247,7 @@ paths = pyofiles.glob("/project", "**/*.py", modified_after=time.time() - 7*8640
 paths = pyofiles.glob("/data", "**/*.csv", min_size_mb=10)
 ```
 
-### `disk_usage(directory, depth=1, top=20, skip_hidden=False, extensions=None, names=None, min_size_mb=None, max_size_mb=None, modified_after=None, modified_before=None, created_after=None, created_before=None, threads=None)`
+### `disk_usage(directory, depth=1, top=20, skip_hidden=False, extensions=None, names=None, min_size_mb=None, max_size_mb=None, modified_after=None, modified_before=None, created_after=None, created_before=None, threads=None, mft=False)`
 Analyze disk space usage by directory. Returns a `DiskUsage` object.
 
 ```python
@@ -259,6 +265,51 @@ usage = pyofiles.disk_usage("/project", modified_after=time.time() - 30*86400)
 # Disk usage of test files
 usage = pyofiles.disk_usage("/project", names=["test"], extensions=[".py"])
 ```
+
+## MFT fast path (Windows)
+
+`walk`, `find`, and `disk_usage` accept `mft=True` (CLI: `--mft`) on Windows.
+Instead of walking directories, pyofiles then reads the volume's NTFS Master
+File Table directly through a raw volume handle -- the same approach WizTree
+and Everything use. One pass over the MFT yields the metadata of every file
+on the volume, which is dramatically faster than directory traversal for
+large subtrees or whole drives.
+
+```python
+# Whole-drive usage in seconds instead of minutes
+usage = pyofiles.disk_usage("C:\\", mft=True, depth=2, top=20)
+
+# Volume-wide name lookups, Everything-style
+hits = pyofiles.find("C:\\", names=["report_2024"], extensions=[".pdf"], mft=True)
+```
+
+All filters, return types, and result shapes match the walk backend. It is
+always an explicit opt-in and never enabled automatically, because the
+requirements and semantics differ:
+
+- **Requirements**: administrator privileges and a local NTFS volume.
+  Without them an `OSError` explains what is missing. UNC and network paths
+  are rejected. On non-Windows builds `mft=True` raises `ValueError`.
+- **Whole-volume scan**: the MFT is read for the entire volume and results
+  are filtered to the requested subtree, so cost is proportional to the
+  volume's total file count, not the subtree's. Huge wins for big trees;
+  overkill for scanning a small folder.
+- **Hard links**: every hard link appears once per name, exactly like a
+  directory walker sees them.
+- **Sizes**: logical sizes of the unnamed data stream, matching
+  `os.stat().st_size`. Alternate data streams are not counted.
+- **Snapshot semantics**: reads the on-disk state. Writes from the last few
+  seconds may not be visible yet, and results are a point-in-time snapshot
+  of the volume.
+- **Access**: raw volume reads bypass file ACLs, so `mft=True` can return
+  entries inside directories a normal walk cannot open.
+- **Reparse points**: symlinks and junctions are listed, not followed.
+- **Paths**: results always use absolute canonical paths (e.g.
+  `C:\Users\...`), regardless of how the directory argument was spelled.
+- `skip_hidden` uses the NTFS hidden attribute plus dot-prefixed names, and
+  hides everything beneath a hidden directory, like the walker does.
+- NTFS metadata files (`$MFT`, `$LogFile`, `$Extend`, ...) are excluded,
+  matching what directory enumeration shows.
 
 ## Types
 
