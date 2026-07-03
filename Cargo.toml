@@ -8,8 +8,7 @@ name = "pyofiles"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.27", features = ["extension-module"] }
-jwalk = "0.8"
+pyo3 = { version = "0.27", features = ["extension-module", "abi3-py39"] }
 globset = "0.4"
 ignore = "0.4"
 dashmap = "6.1"
@@ -19,4 +18,3 @@ strip = true
 lto = "fat"
 codegen-units = 1
 opt-level = 3
-panic = "abort"

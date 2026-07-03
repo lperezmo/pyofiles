@@ -28,3 +28,15 @@ jobs:
           python -c "import pyofiles; print('walk:', len(pyofiles.walk('.'))); print('find:', len(pyofiles.find('.', extensions=['.rs']))); print('glob:', len(pyofiles.glob('.', '**/*.toml'))); print('list_dir:', len(pyofiles.list_dir('.'))); print('index:', len(pyofiles.index('.', ['.rs', '.toml']))); usage = pyofiles.disk_usage('.'); print(f'disk_usage: {usage.total_files} files, {usage.total_size_mb:.2f} MB'); print('All OK')"
           python tests/test_pyofiles.py
         shell: bash
+      - name: CLI smoke test
+        run: |
+          pyofiles --version
+          python -m pyofiles --version
+          pyofiles walk python --ext .py -l
+          pyofiles find . --ext .toml --limit 1
+          pyofiles glob . "**/*.rs"
+          pyofiles ls . --skip-hidden
+          pyofiles index python --ext .py
+          pyofiles du . --top 3 --threads 2
+          pyofiles find . --ext .rs --json
+        shell: bash
