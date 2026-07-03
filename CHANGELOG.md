@@ -1,6 +1,42 @@
 # CHANGELOG
 
 
+## v0.7.0 (2026-07-03)
+
+### Chores
+
+- Document the MFT fast path and its caveats
+  ([`4226b30`](https://github.com/lperezmo/pyofiles/commit/4226b3030ba83ddaf99be803c47df78f9289f796))
+
+### Features
+
+- Ntfs MFT fast path for disk_usage, find and walk
+  ([`212b29a`](https://github.com/lperezmo/pyofiles/commit/212b29a9b65725e09c725b80f6ada470634037ba))
+
+New mft=False keyword on disk_usage, find and walk (CLI: --mft on du, find and walk). On Windows it
+  reads the volume's Master File Table through a raw volume handle instead of walking directories,
+  WizTree style: one pass over all FILE records collects every non-DOS FILE_NAME (hard links emit
+  one entry per link), STANDARD_INFORMATION times and hidden flag, and the unnamed DATA stream size,
+  then reconstructs paths from parent references and filters to the requested subtree. Records are
+  parsed by parallel workers, each with its own volume handle behind a sector-aligned reader
+  (adapted from the ntfs crate's ntfs-shell example) and a chunked read cache.
+
+Results flow through the same Filters and output shapes as the walk backend. Requires administrator
+  privileges and a local NTFS volume; failures raise OSError stating both, UNC paths are rejected,
+  and non-Windows builds raise ValueError.
+
+### Testing
+
+- Cover MFT error paths locally and the real scan in CI
+  ([`2baae39`](https://github.com/lperezmo/pyofiles/commit/2baae39a2d2db5ce8ef684565053b2e0ba957d65))
+
+The local suite asserts the OSError (mentioning administrator) on non-elevated Windows, the UNC
+  rejection, and the ValueError on non-Windows, gated by an elevation check so it behaves
+  everywhere. CI adds a Windows step that runs the real MFT scan on the elevated runner against
+  C:\Windows\System32\drivers, checks find with a limit, and cross-checks file counts against the
+  walk backend within 10 percent, plus an ubuntu step asserting the ValueError.
+
+
 ## v0.6.0 (2026-07-03)
 
 ### Bug Fixes

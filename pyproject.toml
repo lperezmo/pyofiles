@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "pyofiles"
-version = "0.6.0"
+version = "0.7.0"
 description = "Fast, Rust-powered file operations for Python"
 requires-python = ">=3.9"
 license = "MIT"
@@ -24,6 +24,7 @@ classifiers = [
 pyofiles = "pyofiles.cli:main"
 
 
+
 [tool.maturin]
 features = ["pyo3/extension-module"]
 python-source = "python"
@@ -35,6 +36,7 @@ version_toml = [
 ]
 tag_format = "v{version}"
 commit_message = "chore(release): v{version}"
+
 
 
 [dependency-groups]

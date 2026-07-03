@@ -1,6 +1,6 @@
 [package]
 name = "pyofiles"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 
 [lib]
@@ -15,6 +15,7 @@ dashmap = "6.1"
 
 [target.'cfg(windows)'.dependencies]
 ntfs = "0.4"
+
 
 [profile.release]
 strip = true
