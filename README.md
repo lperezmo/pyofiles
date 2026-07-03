@@ -4,7 +4,6 @@
 
   <a href="https://github.com/lperezmo/pyofiles/actions/workflows/ci.yml"><img src="https://github.com/lperezmo/pyofiles/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://pypi.org/project/pyofiles/"><img src="https://img.shields.io/pypi/v/pyofiles" alt="PyPI version"></a>
-  <a href="https://pypistats.org/packages/pyofiles"><img src="https://img.shields.io/pypi/dm/pyofiles" alt="Downloads"></a>
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-%E2%89%A53.9-blue" alt="Python ≥3.9"></a>
   <a href="https://github.com/lperezmo/pyofiles/blob/master/LICENSE"><img src="https://img.shields.io/github/license/lperezmo/pyofiles" alt="License"></a>
 </div>
@@ -80,6 +79,12 @@ pyofiles find ./data --ext .csv --min-size 100 --modified-after 24h
 # Find by size alone
 pyofiles find . --min-size 500
 
+# Stop after the first match (fast lookups in huge trees)
+pyofiles find ./drawings --names P-1042 --limit 1
+
+# Tune walker threads (more helps on network drives)
+pyofiles find //server/share --ext .pdf --threads 16
+
 # Glob pattern matching (with time/size filters)
 pyofiles glob ./project "**/*.rs"
 pyofiles glob ./project "**/*.py" --modified-after 7d --max-depth 3
@@ -125,11 +130,16 @@ All filters are available across commands where they make sense:
 | `--skip-hidden` | yes | yes | yes | yes | yes | yes |
 | `--max-depth` | yes | yes | — | yes | yes | — |
 | time filters | yes | yes | yes | yes | yes | yes |
+| `--limit` | — | yes | — | — | — | — |
+| `--threads` | yes | yes | — | yes | yes | yes |
 
 ## Python API
 
-### `walk(directory, extensions=None, skip_hidden=False, max_depth=None, names=None, min_size_mb=None, max_size_mb=None, modified_after=None, modified_before=None, created_after=None, created_before=None)`
+### `walk(directory, extensions=None, skip_hidden=False, max_depth=None, names=None, min_size_mb=None, max_size_mb=None, modified_after=None, modified_before=None, created_after=None, created_before=None, threads=None)`
 Parallel recursive directory walk. Returns `list[FileEntry]`.
+
+When any filter is given, only matching files are returned; directories are
+omitted. Without filters, files and directories are both included.
 
 ```python
 import pyofiles
@@ -152,8 +162,12 @@ for e in entries:
         print(f"{e.name} ({e.size} bytes)")
 ```
 
-### `find(directory, names=None, extensions=None, min_size_mb=None, max_size_mb=None, skip_hidden=False, max_depth=None, modified_after=None, modified_before=None, created_after=None, created_before=None)`
+### `find(directory, names=None, extensions=None, min_size_mb=None, max_size_mb=None, skip_hidden=False, max_depth=None, modified_after=None, modified_before=None, created_after=None, created_before=None, limit=None, threads=None)`
 Search for files by name substrings, extensions, size, and time. Accepts **multiple substrings** -- a file matches if its name contains ANY of them (case-insensitive).
+
+`limit=N` stops the search as soon as N matches are found, which makes
+single-file lookups in huge trees return almost immediately. Which matches
+are returned when the limit truncates is unspecified.
 
 ```python
 # Find files containing "report" or "invoice" in the name
@@ -174,10 +188,13 @@ results = pyofiles.find("/logs", names=["error"],
 
 # Find by size alone
 results = pyofiles.find("/data", min_size_mb=500)
+
+# First match only: stops walking as soon as it is found
+results = pyofiles.find("/drawings", names=["P-1042"], limit=1)
 ```
 
 ### `list_dir(directory, extensions=None, names=None, min_size_mb=None, max_size_mb=None, skip_hidden=False, modified_after=None, modified_before=None, created_after=None, created_before=None)`
-Non-recursive single-directory listing. Returns `list[FileEntry]`.
+Non-recursive single-directory listing. Returns `list[FileEntry]` sorted by name.
 
 ```python
 entries = pyofiles.list_dir("/path")
@@ -189,8 +206,12 @@ entries = pyofiles.list_dir("/src", extensions=[".py"], skip_hidden=True)
 entries = pyofiles.list_dir("/data", modified_after=time.time() - 86400)
 ```
 
-### `index(directory, extensions, skip_hidden=False, max_depth=None, names=None, min_size_mb=None, max_size_mb=None, modified_after=None, modified_before=None, created_after=None, created_before=None)`
+### `index(directory, extensions, skip_hidden=False, max_depth=None, names=None, min_size_mb=None, max_size_mb=None, modified_after=None, modified_before=None, created_after=None, created_before=None, threads=None)`
 Build a file index grouped by filename stem. Useful for finding related files with different extensions.
+
+If two files share the same stem and extension (e.g. in different
+subdirectories), the lexicographically smallest full path is kept, so
+results are deterministic.
 
 ```python
 idx = pyofiles.index("/src", extensions=[".py", ".pyi", ".pyc"])
@@ -203,8 +224,11 @@ idx = pyofiles.index("/src", extensions=[".py"], modified_after=time.time() - 7*
 idx = pyofiles.index("/project", extensions=[".py"], max_depth=3)
 ```
 
-### `glob(directory, pattern, skip_hidden=False, max_depth=None, min_size_mb=None, max_size_mb=None, modified_after=None, modified_before=None, created_after=None, created_before=None)`
+### `glob(directory, pattern, skip_hidden=False, max_depth=None, min_size_mb=None, max_size_mb=None, modified_after=None, modified_before=None, created_after=None, created_before=None, threads=None)`
 Parallel glob pattern matching. Returns `list[str]` of full paths.
+
+Patterns with a literal directory prefix (e.g. `src/**/*.py`) start the
+walk at that directory instead of scanning the whole tree.
 
 ```python
 paths = pyofiles.glob("/project", "**/*.py")
@@ -217,7 +241,7 @@ paths = pyofiles.glob("/project", "**/*.py", modified_after=time.time() - 7*8640
 paths = pyofiles.glob("/data", "**/*.csv", min_size_mb=10)
 ```
 
-### `disk_usage(directory, depth=1, top=20, skip_hidden=False, extensions=None, names=None, min_size_mb=None, max_size_mb=None, modified_after=None, modified_before=None, created_after=None, created_before=None)`
+### `disk_usage(directory, depth=1, top=20, skip_hidden=False, extensions=None, names=None, min_size_mb=None, max_size_mb=None, modified_after=None, modified_before=None, created_after=None, created_before=None, threads=None)`
 Analyze disk space usage by directory. Returns a `DiskUsage` object.
 
 ```python
@@ -277,9 +301,26 @@ Returned by `disk_usage`.
 | `total_size_mb` | `float`           |
 | `total_size_gb` | `float`           |
 
+## Behavior notes
+
+- **Hidden files**: `skip_hidden` skips dot-prefixed names everywhere, and also
+  files with the hidden attribute on Windows.
+- **Creation time**: on filesystems that do not support creation time (some
+  Linux setups), `created_after`/`created_before` match no files. `FileEntry.created`
+  is `None` there.
+- **Unreadable metadata**: when a size or time filter is active, files whose
+  metadata cannot be read are excluded.
+- **Result order**: `walk`, `find`, and `glob` run in parallel and return results
+  in no particular order. `list_dir` is sorted by name.
+
 ## Performance
 
-Built on [jwalk](https://crates.io/crates/jwalk) (parallel directory walker) and [PyO3](https://pyo3.rs). Typically **5-50x faster** than equivalent Python code, especially on large directories and network drives.
+Every recursive operation runs on the [ignore](https://crates.io/crates/ignore)
+crate's parallel directory walker (the same engine ripgrep uses), with metadata
+taken from the directory read itself wherever the platform provides it (free on
+Windows). Bindings via [PyO3](https://pyo3.rs). Typically **5-50x faster** than
+equivalent Python code, especially on large directories and network drives.
+Wheels are abi3: one wheel per platform covers Python 3.9+.
 
 ## License
 
