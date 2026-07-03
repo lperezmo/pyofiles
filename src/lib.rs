@@ -4,12 +4,12 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
-use jwalk::WalkDir;
-use globset::Glob as GlobPattern;
-use ignore::WalkBuilder;
 use dashmap::DashMap;
+use globset::Glob as GlobPattern;
+use ignore::{WalkBuilder, WalkState};
 
 // ─── Data Types ─────────────────────────────────────────────
 
@@ -162,20 +162,6 @@ fn check_size_filters(size: u64, min_bytes: Option<u64>, max_bytes: Option<u64>)
     true
 }
 
-fn check_name_filter(name_lower: &str, names_lower: &Option<Vec<String>>) -> bool {
-    match names_lower {
-        Some(patterns) => patterns.iter().any(|p| name_lower.contains(p)),
-        None => true,
-    }
-}
-
-fn check_ext_filter(name_lower: &str, exts: &Option<Vec<String>>) -> bool {
-    match exts {
-        Some(exts) => exts.iter().any(|e| name_lower.ends_with(e)),
-        None => true,
-    }
-}
-
 fn mb_to_bytes(mb: Option<f64>) -> Option<u64> {
     mb.map(|v| (v * 1024.0 * 1024.0) as u64)
 }
@@ -213,9 +199,145 @@ fn get_depth_path(path: &Path, base: &Path, target_depth: usize) -> Option<PathB
     Some(result)
 }
 
+fn default_threads(threads: Option<usize>) -> usize {
+    threads
+        .filter(|&t| t > 0)
+        .unwrap_or_else(|| thread::available_parallelism().map(|n| n.get()).unwrap_or(4))
+}
+
+/// Hidden check for list_dir: dot prefix everywhere, plus the hidden
+/// attribute on Windows (matching what the parallel walker does).
+fn is_hidden(name: &str, metadata: Option<&std::fs::Metadata>) -> bool {
+    if name.starts_with('.') {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+        if let Some(m) = metadata {
+            if m.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0 {
+                return true;
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = metadata;
+    false
+}
+
+/// Shared file filters. Name checks allocate only when a name-based
+/// filter is actually set; metadata checks exclude files whose metadata
+/// cannot be read whenever a size or time filter is active.
+#[derive(Clone)]
+struct Filters {
+    exts: Option<Vec<String>>,
+    names: Option<Vec<String>>,
+    min_bytes: Option<u64>,
+    max_bytes: Option<u64>,
+    modified_after: Option<f64>,
+    modified_before: Option<f64>,
+    created_after: Option<f64>,
+    created_before: Option<f64>,
+}
+
+impl Filters {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        extensions: Option<Vec<String>>,
+        names: Option<Vec<String>>,
+        min_size_mb: Option<f64>,
+        max_size_mb: Option<f64>,
+        modified_after: Option<f64>,
+        modified_before: Option<f64>,
+        created_after: Option<f64>,
+        created_before: Option<f64>,
+    ) -> Self {
+        Filters {
+            exts: extensions.map(|e| normalize_exts(&e)),
+            names: names.map(|n| n.iter().map(|s| s.to_lowercase()).collect()),
+            min_bytes: mb_to_bytes(min_size_mb),
+            max_bytes: mb_to_bytes(max_size_mb),
+            modified_after,
+            modified_before,
+            created_after,
+            created_before,
+        }
+    }
+
+    fn has_name_filters(&self) -> bool {
+        self.exts.is_some() || self.names.is_some()
+    }
+
+    fn has_time_filters(&self) -> bool {
+        self.modified_after.is_some() || self.modified_before.is_some()
+            || self.created_after.is_some() || self.created_before.is_some()
+    }
+
+    fn has_meta_filters(&self) -> bool {
+        self.min_bytes.is_some() || self.max_bytes.is_some() || self.has_time_filters()
+    }
+
+    fn has_any(&self) -> bool {
+        self.has_name_filters() || self.has_meta_filters()
+    }
+
+    fn matches_name(&self, name: &str) -> bool {
+        if !self.has_name_filters() {
+            return true;
+        }
+        let name_lower = name.to_lowercase();
+        if let Some(exts) = &self.exts {
+            if !exts.iter().any(|e| name_lower.ends_with(e.as_str())) {
+                return false;
+            }
+        }
+        if let Some(patterns) = &self.names {
+            if !patterns.iter().any(|p| name_lower.contains(p.as_str())) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn matches_metadata(&self, metadata: Option<&std::fs::Metadata>) -> bool {
+        if !self.has_meta_filters() {
+            return true;
+        }
+        let meta = match metadata {
+            Some(m) => m,
+            None => return false,
+        };
+        if !check_size_filters(meta.len(), self.min_bytes, self.max_bytes) {
+            return false;
+        }
+        check_time_filters(meta, self.modified_after, self.modified_before, self.created_after, self.created_before)
+    }
+}
+
+/// Build the parallel walker used by every recursive function. All
+/// gitignore semantics are disabled: pyofiles always sees every file.
+fn build_walker(directory: &Path, skip_hidden: bool, max_depth: Option<usize>, threads: Option<usize>) -> ignore::WalkParallel {
+    WalkBuilder::new(directory)
+        .follow_links(false)
+        .hidden(skip_hidden)
+        .git_ignore(false)
+        .git_global(false)
+        .git_exclude(false)
+        .ignore(false)
+        .parents(false)
+        .max_depth(max_depth)
+        .threads(default_threads(threads))
+        .build_parallel()
+}
+
 // ─── Functions ──────────────────────────────────────────────
 
 /// Recursively walk a directory in parallel, returning all entries.
+///
+/// When any filter is given, only matching files are returned;
+/// directories are omitted. Without filters, files and directories
+/// are both included.
 ///
 /// Args:
 ///     directory: Path to walk.
@@ -229,11 +351,13 @@ fn get_depth_path(path: &Path, base: &Path, target_depth: usize) -> Option<PathB
 ///     modified_before: Only include files modified before this unix timestamp.
 ///     created_after: Only include files created after this unix timestamp.
 ///     created_before: Only include files created before this unix timestamp.
+///     threads: Number of walker threads (default: number of CPUs).
 ///
 /// Returns:
-///     List of FileEntry objects (both files and directories).
+///     List of FileEntry objects.
 #[pyfunction]
-#[pyo3(signature = (directory, extensions=None, skip_hidden=false, max_depth=None, names=None, min_size_mb=None, max_size_mb=None, modified_after=None, modified_before=None, created_after=None, created_before=None))]
+#[pyo3(signature = (directory, extensions=None, skip_hidden=false, max_depth=None, names=None, min_size_mb=None, max_size_mb=None, modified_after=None, modified_before=None, created_after=None, created_before=None, threads=None))]
+#[allow(clippy::too_many_arguments)]
 fn walk(
     py: Python<'_>,
     directory: String,
@@ -247,75 +371,60 @@ fn walk(
     modified_before: Option<f64>,
     created_after: Option<f64>,
     created_before: Option<f64>,
+    threads: Option<usize>,
 ) -> PyResult<Vec<FileEntry>> {
     validate_dir(&directory)?;
+    let filters = Filters::new(extensions, names, min_size_mb, max_size_mb, modified_after, modified_before, created_after, created_before);
 
     py.detach(|| {
-        let mut walker = WalkDir::new(&directory).skip_hidden(skip_hidden);
-        if let Some(depth) = max_depth {
-            walker = walker.max_depth(depth);
-        }
+        let include_non_files = !filters.has_any();
+        let (tx, rx) = mpsc::channel::<FileEntry>();
+        let walker = build_walker(Path::new(&directory), skip_hidden, max_depth, threads);
 
-        let exts: Option<Vec<String>> = extensions.map(|e| normalize_exts(&e));
-        let names_lower: Option<Vec<String>> = names.map(|n| n.iter().map(|s| s.to_lowercase()).collect());
-        let min_bytes = mb_to_bytes(min_size_mb);
-        let max_bytes = mb_to_bytes(max_size_mb);
-        let has_time_filters = modified_after.is_some() || modified_before.is_some()
-            || created_after.is_some() || created_before.is_some();
-
-        let entries: Vec<FileEntry> = walker
-            .into_iter()
-            .filter_map(|entry| {
-                let entry = entry.ok()?;
-                let path = entry.path();
-                let name = entry.file_name().to_string_lossy().to_string();
-                let is_file = entry.file_type().is_file();
-                let is_dir = entry.file_type().is_dir();
-
-                // File-only filters: extension, name
-                if is_file {
-                    let name_lower = name.to_lowercase();
-                    if !check_ext_filter(&name_lower, &exts) {
-                        return None;
-                    }
-                    if !check_name_filter(&name_lower, &names_lower) {
-                        return None;
-                    }
+        walker.run(|| {
+            let tx = tx.clone();
+            let filters = filters.clone();
+            Box::new(move |result| {
+                let entry = match result {
+                    Ok(e) => e,
+                    Err(_) => return WalkState::Continue,
+                };
+                let file_type = entry.file_type();
+                let is_file = file_type.map(|ft| ft.is_file()).unwrap_or(false);
+                let is_dir = file_type.map(|ft| ft.is_dir()).unwrap_or(false);
+                if !is_file && !include_non_files {
+                    return WalkState::Continue;
                 }
 
-                let metadata = path.metadata().ok();
+                let name = entry.file_name().to_string_lossy().to_string();
+                if is_file && !filters.matches_name(&name) {
+                    return WalkState::Continue;
+                }
+
+                let metadata = entry.metadata().ok();
+                if is_file && !filters.matches_metadata(metadata.as_ref()) {
+                    return WalkState::Continue;
+                }
+
                 let size = if is_file {
                     metadata.as_ref().map(|m| m.len()).unwrap_or(0)
                 } else {
                     0
                 };
-
-                // File-only filters: size, time
-                if is_file {
-                    if !check_size_filters(size, min_bytes, max_bytes) {
-                        return None;
-                    }
-                    if has_time_filters {
-                        if let Some(ref meta) = metadata {
-                            if !check_time_filters(meta, modified_after, modified_before, created_after, created_before) {
-                                return None;
-                            }
-                        }
-                    }
-                }
-
                 let modified = metadata.as_ref().and_then(|m| m.modified().ok()).and_then(systemtime_to_epoch);
                 let created = metadata.as_ref().and_then(|m| m.created().ok()).and_then(systemtime_to_epoch);
 
-                Some(make_entry(&path, name, is_file, is_dir, size, modified, created))
+                let _ = tx.send(make_entry(entry.path(), name, is_file, is_dir, size, modified, created));
+                WalkState::Continue
             })
-            .collect();
+        });
 
-        Ok(entries)
+        drop(tx);
+        Ok(rx.into_iter().collect())
     })
 }
 
-/// List contents of a single directory (non-recursive).
+/// List contents of a single directory (non-recursive), sorted by name.
 ///
 /// Args:
 ///     directory: Path to list.
@@ -330,9 +439,10 @@ fn walk(
 ///     created_before: Only include files created before this unix timestamp.
 ///
 /// Returns:
-///     List of FileEntry objects in the directory.
+///     List of FileEntry objects in the directory, sorted by name.
 #[pyfunction]
 #[pyo3(signature = (directory, extensions=None, names=None, min_size_mb=None, max_size_mb=None, skip_hidden=false, modified_after=None, modified_before=None, created_after=None, created_before=None))]
+#[allow(clippy::too_many_arguments)]
 fn list_dir(
     py: Python<'_>,
     directory: String,
@@ -347,64 +457,45 @@ fn list_dir(
     created_before: Option<f64>,
 ) -> PyResult<Vec<FileEntry>> {
     validate_dir(&directory)?;
+    let filters = Filters::new(extensions, names, min_size_mb, max_size_mb, modified_after, modified_before, created_after, created_before);
 
     py.detach(|| {
-        let exts = extensions.map(|e| normalize_exts(&e));
-        let names_lower: Option<Vec<String>> = names.map(|n| n.iter().map(|s| s.to_lowercase()).collect());
-        let min_bytes = mb_to_bytes(min_size_mb);
-        let max_bytes = mb_to_bytes(max_size_mb);
-        let has_time_filters = modified_after.is_some() || modified_before.is_some()
-            || created_after.is_some() || created_before.is_some();
-
         let mut entries = Vec::new();
         let dir = std::fs::read_dir(&directory)
             .map_err(|e| PyOSError::new_err(format!("Cannot read directory: {}", e)))?;
 
-        for item in dir {
-            if let Ok(item) = item {
-                let path = item.path();
-                let name = item.file_name().to_string_lossy().to_string();
+        for item in dir.flatten() {
+            let path = item.path();
+            let name = item.file_name().to_string_lossy().to_string();
+            let metadata = item.metadata().ok();
 
-                // Skip hidden
-                if skip_hidden && name.starts_with('.') {
+            if skip_hidden && is_hidden(&name, metadata.as_ref()) {
+                continue;
+            }
+
+            let is_file = metadata.as_ref().map(|m| m.is_file()).unwrap_or(false);
+            let is_dir = metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+            let size = if is_file {
+                metadata.as_ref().map(|m| m.len()).unwrap_or(0)
+            } else {
+                0
+            };
+
+            if is_file {
+                if !filters.matches_name(&name) {
                     continue;
                 }
-
-                let metadata = item.metadata().ok();
-                let is_file = metadata.as_ref().map(|m| m.is_file()).unwrap_or(false);
-                let is_dir = metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false);
-                let size = if is_file {
-                    metadata.as_ref().map(|m| m.len()).unwrap_or(0)
-                } else {
-                    0
-                };
-
-                // File-only filters
-                if is_file {
-                    let name_lower = name.to_lowercase();
-                    if !check_ext_filter(&name_lower, &exts) {
-                        continue;
-                    }
-                    if !check_name_filter(&name_lower, &names_lower) {
-                        continue;
-                    }
-                    if !check_size_filters(size, min_bytes, max_bytes) {
-                        continue;
-                    }
-                    if has_time_filters {
-                        if let Some(ref meta) = metadata {
-                            if !check_time_filters(meta, modified_after, modified_before, created_after, created_before) {
-                                continue;
-                            }
-                        }
-                    }
+                if !filters.matches_metadata(metadata.as_ref()) {
+                    continue;
                 }
-
-                let modified = metadata.as_ref().and_then(|m| m.modified().ok()).and_then(systemtime_to_epoch);
-                let created = metadata.as_ref().and_then(|m| m.created().ok()).and_then(systemtime_to_epoch);
-                entries.push(make_entry(&path, name, is_file, is_dir, size, modified, created));
             }
+
+            let modified = metadata.as_ref().and_then(|m| m.modified().ok()).and_then(systemtime_to_epoch);
+            let created = metadata.as_ref().and_then(|m| m.created().ok()).and_then(systemtime_to_epoch);
+            entries.push(make_entry(&path, name, is_file, is_dir, size, modified, created));
         }
+
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(entries)
     })
 }
@@ -426,6 +517,9 @@ fn list_dir(
 ///     modified_before: Only include files modified before this unix timestamp.
 ///     created_after: Only include files created after this unix timestamp.
 ///     created_before: Only include files created before this unix timestamp.
+///     limit: Stop searching once this many matches are found. Which
+///         matches are returned when the limit truncates is unspecified.
+///     threads: Number of walker threads (default: number of CPUs).
 ///
 /// Returns:
 ///     List of matching FileEntry objects (files only).
@@ -433,7 +527,8 @@ fn list_dir(
 /// Example:
 ///     find("/data", names=["report", "summary"], extensions=[".pdf", ".docx"])
 #[pyfunction]
-#[pyo3(signature = (directory, names=None, extensions=None, min_size_mb=None, max_size_mb=None, skip_hidden=false, max_depth=None, modified_after=None, modified_before=None, created_after=None, created_before=None))]
+#[pyo3(signature = (directory, names=None, extensions=None, min_size_mb=None, max_size_mb=None, skip_hidden=false, max_depth=None, modified_after=None, modified_before=None, created_after=None, created_before=None, limit=None, threads=None))]
+#[allow(clippy::too_many_arguments)]
 fn find(
     py: Python<'_>,
     directory: String,
@@ -447,75 +542,75 @@ fn find(
     modified_before: Option<f64>,
     created_after: Option<f64>,
     created_before: Option<f64>,
+    limit: Option<usize>,
+    threads: Option<usize>,
 ) -> PyResult<Vec<FileEntry>> {
     validate_dir(&directory)?;
+    let filters = Filters::new(extensions, names, min_size_mb, max_size_mb, modified_after, modified_before, created_after, created_before);
 
-    if names.is_none() && extensions.is_none()
-        && min_size_mb.is_none() && max_size_mb.is_none()
-        && modified_after.is_none() && modified_before.is_none()
-        && created_after.is_none() && created_before.is_none()
-    {
+    if !filters.has_any() {
         return Err(PyValueError::new_err(
             "Must provide at least `names`, `extensions`, a size filter, or a time filter"
         ));
     }
+    if limit == Some(0) {
+        return Ok(Vec::new());
+    }
 
     py.detach(|| {
-        let mut walker = WalkDir::new(&directory).skip_hidden(skip_hidden);
-        if let Some(depth) = max_depth {
-            walker = walker.max_depth(depth);
-        }
+        let (tx, rx) = mpsc::channel::<FileEntry>();
+        let walker = build_walker(Path::new(&directory), skip_hidden, max_depth, threads);
+        let sent = Arc::new(AtomicUsize::new(0));
 
-        let names_lower: Option<Vec<String>> =
-            names.map(|n| n.iter().map(|s| s.to_lowercase()).collect());
-        let exts_lower: Option<Vec<String>> =
-            extensions.map(|e| normalize_exts(&e));
-        let min_bytes = mb_to_bytes(min_size_mb);
-        let max_bytes = mb_to_bytes(max_size_mb);
-
-        let entries: Vec<FileEntry> = walker
-            .into_iter()
-            .filter_map(|entry| {
-                let entry = entry.ok()?;
-                if !entry.file_type().is_file() {
-                    return None;
-                }
-
-                let path = entry.path();
-                let name = entry.file_name().to_string_lossy().to_string();
-                let name_lower = name.to_lowercase();
-
-                // Name substring match (any substring matches -> include)
-                if !check_name_filter(&name_lower, &names_lower) {
-                    return None;
-                }
-
-                // Extension match
-                if !check_ext_filter(&name_lower, &exts_lower) {
-                    return None;
-                }
-
-                // Size and time filters (single metadata call)
-                let metadata = path.metadata().ok();
-                let size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
-                if !check_size_filters(size, min_bytes, max_bytes) {
-                    return None;
-                }
-
-                // Time filters
-                if let Some(ref meta) = metadata {
-                    if !check_time_filters(meta, modified_after, modified_before, created_after, created_before) {
-                        return None;
+        walker.run(|| {
+            let tx = tx.clone();
+            let filters = filters.clone();
+            let sent = Arc::clone(&sent);
+            Box::new(move |result| {
+                if let Some(lim) = limit {
+                    if sent.load(Ordering::Relaxed) >= lim {
+                        return WalkState::Quit;
                     }
                 }
 
+                let entry = match result {
+                    Ok(e) => e,
+                    Err(_) => return WalkState::Continue,
+                };
+                if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+                    return WalkState::Continue;
+                }
+
+                let name = entry.file_name().to_string_lossy().to_string();
+                if !filters.matches_name(&name) {
+                    return WalkState::Continue;
+                }
+
+                let metadata = entry.metadata().ok();
+                if !filters.matches_metadata(metadata.as_ref()) {
+                    return WalkState::Continue;
+                }
+
+                let size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
                 let modified = metadata.as_ref().and_then(|m| m.modified().ok()).and_then(systemtime_to_epoch);
                 let created = metadata.as_ref().and_then(|m| m.created().ok()).and_then(systemtime_to_epoch);
 
-                Some(make_entry(&path, name, true, false, size, modified, created))
-            })
-            .collect();
+                let _ = tx.send(make_entry(entry.path(), name, true, false, size, modified, created));
 
+                if let Some(lim) = limit {
+                    if sent.fetch_add(1, Ordering::Relaxed) + 1 >= lim {
+                        return WalkState::Quit;
+                    }
+                }
+                WalkState::Continue
+            })
+        });
+
+        drop(tx);
+        let mut entries: Vec<FileEntry> = rx.into_iter().collect();
+        if let Some(lim) = limit {
+            entries.truncate(lim);
+        }
         Ok(entries)
     })
 }
@@ -524,6 +619,10 @@ fn find(
 ///
 /// Returns a dict mapping lowercase filename stems to dicts of {extension: full_path}.
 /// Useful for finding related files with different extensions.
+///
+/// If two files share the same stem and extension (e.g. in different
+/// subdirectories), the lexicographically smallest full path is kept,
+/// so results are deterministic.
 ///
 /// Args:
 ///     directory: Root directory to index.
@@ -537,11 +636,13 @@ fn find(
 ///     modified_before: Only include files modified before this unix timestamp.
 ///     created_after: Only include files created after this unix timestamp.
 ///     created_before: Only include files created before this unix timestamp.
+///     threads: Number of walker threads (default: number of CPUs).
 ///
 /// Returns:
 ///     Dict like {"main": {".py": "/src/main.py", ".pyc": "/src/main.pyc"}}
 #[pyfunction]
-#[pyo3(signature = (directory, extensions, skip_hidden=false, max_depth=None, names=None, min_size_mb=None, max_size_mb=None, modified_after=None, modified_before=None, created_after=None, created_before=None))]
+#[pyo3(signature = (directory, extensions, skip_hidden=false, max_depth=None, names=None, min_size_mb=None, max_size_mb=None, modified_after=None, modified_before=None, created_after=None, created_before=None, threads=None))]
+#[allow(clippy::too_many_arguments)]
 fn index(
     py: Python<'_>,
     directory: String,
@@ -555,65 +656,90 @@ fn index(
     modified_before: Option<f64>,
     created_after: Option<f64>,
     created_before: Option<f64>,
+    threads: Option<usize>,
 ) -> PyResult<HashMap<String, HashMap<String, String>>> {
     validate_dir(&directory)?;
+    let exts = normalize_exts(&extensions);
+    let filters = Filters::new(None, names, min_size_mb, max_size_mb, modified_after, modified_before, created_after, created_before);
 
     py.detach(|| {
-        let exts = normalize_exts(&extensions);
-        let names_lower: Option<Vec<String>> = names.map(|n| n.iter().map(|s| s.to_lowercase()).collect());
-        let min_bytes = mb_to_bytes(min_size_mb);
-        let max_bytes = mb_to_bytes(max_size_mb);
-        let has_meta_filters = min_bytes.is_some() || max_bytes.is_some()
-            || modified_after.is_some() || modified_before.is_some()
-            || created_after.is_some() || created_before.is_some();
+        let (tx, rx) = mpsc::channel::<(String, String, String)>();
+        let walker = build_walker(Path::new(&directory), skip_hidden, max_depth, threads);
 
-        let mut walker = WalkDir::new(&directory).skip_hidden(skip_hidden);
-        if let Some(depth) = max_depth {
-            walker = walker.max_depth(depth);
-        }
+        walker.run(|| {
+            let tx = tx.clone();
+            let exts = exts.clone();
+            let filters = filters.clone();
+            Box::new(move |result| {
+                let entry = match result {
+                    Ok(e) => e,
+                    Err(_) => return WalkState::Continue,
+                };
+                if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+                    return WalkState::Continue;
+                }
 
+                let name = entry.file_name().to_string_lossy();
+                let name_lower = name.to_lowercase();
+
+                if let Some(patterns) = &filters.names {
+                    if !patterns.iter().any(|p| name_lower.contains(p.as_str())) {
+                        return WalkState::Continue;
+                    }
+                }
+                if filters.has_meta_filters() && !filters.matches_metadata(entry.metadata().ok().as_ref()) {
+                    return WalkState::Continue;
+                }
+
+                for ext in &exts {
+                    if name_lower.ends_with(ext.as_str()) {
+                        let stem = name_lower.strip_suffix(ext.as_str()).unwrap_or(&name_lower).to_string();
+                        let full_path = entry.path().to_string_lossy().to_string();
+                        let _ = tx.send((stem, ext.clone(), full_path));
+                    }
+                }
+                WalkState::Continue
+            })
+        });
+
+        drop(tx);
         let mut file_index: HashMap<String, HashMap<String, String>> = HashMap::new();
-
-        for entry in walker {
-            if let Ok(entry) = entry {
-                if entry.file_type().is_file() {
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    let name_lower = name.to_lowercase();
-
-                    // Name filter
-                    if !check_name_filter(&name_lower, &names_lower) {
-                        continue;
-                    }
-
-                    // Size and time filters (require metadata)
-                    if has_meta_filters {
-                        if let Ok(metadata) = entry.path().metadata() {
-                            let size = metadata.len();
-                            if !check_size_filters(size, min_bytes, max_bytes) {
-                                continue;
-                            }
-                            if !check_time_filters(&metadata, modified_after, modified_before, created_after, created_before) {
-                                continue;
-                            }
-                        }
-                    }
-
-                    for ext in &exts {
-                        if name_lower.ends_with(ext) {
-                            let key = name_lower.strip_suffix(ext).unwrap_or(&name_lower).to_string();
-                            let full_path = entry.path().to_string_lossy().to_string();
-                            file_index
-                                .entry(key)
-                                .or_default()
-                                .insert(ext.clone(), full_path);
-                        }
+        for (stem, ext, path) in rx {
+            use std::collections::hash_map::Entry;
+            match file_index.entry(stem).or_default().entry(ext) {
+                Entry::Vacant(slot) => {
+                    slot.insert(path);
+                }
+                Entry::Occupied(mut slot) => {
+                    if path < *slot.get() {
+                        slot.insert(path);
                     }
                 }
             }
         }
-
         Ok(file_index)
     })
+}
+
+const GLOB_META_CHARS: &[char] = &['*', '?', '[', '{'];
+
+/// Leading literal directory components of a glob pattern, used to start
+/// the walk as deep as possible instead of scanning the whole tree.
+fn literal_prefix_components(pattern: &str) -> Vec<&str> {
+    let components: Vec<&str> = pattern.split('/').collect();
+    let mut n = 0;
+    for c in &components {
+        if c.is_empty() || *c == "." || *c == ".." || c.contains(GLOB_META_CHARS) {
+            break;
+        }
+        n += 1;
+    }
+    // A fully literal pattern still needs its last component matched as
+    // the file name, so never consume the final component as a directory.
+    if n == components.len() && n > 0 {
+        n -= 1;
+    }
+    components[..n].to_vec()
 }
 
 /// Match files against a glob pattern.
@@ -629,11 +755,13 @@ fn index(
 ///     modified_before: Only include files modified before this unix timestamp.
 ///     created_after: Only include files created after this unix timestamp.
 ///     created_before: Only include files created before this unix timestamp.
+///     threads: Number of walker threads (default: number of CPUs).
 ///
 /// Returns:
 ///     List of full paths matching the pattern.
 #[pyfunction]
-#[pyo3(signature = (directory, pattern, skip_hidden=false, max_depth=None, min_size_mb=None, max_size_mb=None, modified_after=None, modified_before=None, created_after=None, created_before=None))]
+#[pyo3(signature = (directory, pattern, skip_hidden=false, max_depth=None, min_size_mb=None, max_size_mb=None, modified_after=None, modified_before=None, created_after=None, created_before=None, threads=None))]
+#[allow(clippy::too_many_arguments)]
 fn glob(
     py: Python<'_>,
     directory: String,
@@ -646,58 +774,73 @@ fn glob(
     modified_before: Option<f64>,
     created_after: Option<f64>,
     created_before: Option<f64>,
+    threads: Option<usize>,
 ) -> PyResult<Vec<String>> {
     validate_dir(&directory)?;
+    let filters = Filters::new(None, None, min_size_mb, max_size_mb, modified_after, modified_before, created_after, created_before);
 
     py.detach(|| {
         let matcher = GlobPattern::new(&pattern)
             .map_err(|e| PyValueError::new_err(format!("Invalid glob pattern: {}", e)))?
             .compile_matcher();
 
-        let base = Path::new(&directory);
-        let min_bytes = mb_to_bytes(min_size_mb);
-        let max_bytes = mb_to_bytes(max_size_mb);
-        let has_meta_filters = min_bytes.is_some() || max_bytes.is_some()
-            || modified_after.is_some() || modified_before.is_some()
-            || created_after.is_some() || created_before.is_some();
+        let base = Arc::new(PathBuf::from(&directory));
 
-        let mut walker = WalkDir::new(&directory).skip_hidden(skip_hidden);
-        if let Some(depth) = max_depth {
-            walker = walker.max_depth(depth);
+        // Start the walk at the deepest literal directory in the pattern.
+        let prefix = literal_prefix_components(&pattern);
+        let prefix_depth = prefix.len();
+        let mut start = base.as_ref().clone();
+        for component in &prefix {
+            start.push(component);
         }
+        if prefix_depth > 0 && !start.is_dir() {
+            return Ok(Vec::new());
+        }
+        let effective_depth = match max_depth {
+            Some(d) if d < prefix_depth => return Ok(Vec::new()),
+            Some(d) => Some(d - prefix_depth),
+            None => None,
+        };
 
-        let paths: Vec<String> = walker
-            .into_iter()
-            .filter_map(|entry| {
-                let entry = entry.ok()?;
-                if !entry.file_type().is_file() {
-                    return None;
+        let (tx, rx) = mpsc::channel::<String>();
+        let walker = build_walker(&start, skip_hidden, effective_depth, threads);
+
+        walker.run(|| {
+            let tx = tx.clone();
+            let filters = filters.clone();
+            let matcher = matcher.clone();
+            let base = Arc::clone(&base);
+            Box::new(move |result| {
+                let entry = match result {
+                    Ok(e) => e,
+                    Err(_) => return WalkState::Continue,
+                };
+                if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+                    return WalkState::Continue;
                 }
+
                 let path = entry.path();
-                let relative = path.strip_prefix(base).ok()?;
+                let relative = match path.strip_prefix(base.as_path()) {
+                    Ok(r) => r,
+                    Err(_) => return WalkState::Continue,
+                };
                 // Normalize separators for cross-platform glob matching
                 let rel_str = relative.to_string_lossy().replace('\\', "/");
                 if !matcher.is_match(&rel_str) {
-                    return None;
+                    return WalkState::Continue;
                 }
 
-                // Size and time filters
-                if has_meta_filters {
-                    let metadata = path.metadata().ok()?;
-                    let size = metadata.len();
-                    if !check_size_filters(size, min_bytes, max_bytes) {
-                        return None;
-                    }
-                    if !check_time_filters(&metadata, modified_after, modified_before, created_after, created_before) {
-                        return None;
-                    }
+                if filters.has_meta_filters() && !filters.matches_metadata(entry.metadata().ok().as_ref()) {
+                    return WalkState::Continue;
                 }
 
-                Some(path.to_string_lossy().to_string())
+                let _ = tx.send(path.to_string_lossy().to_string());
+                WalkState::Continue
             })
-            .collect();
+        });
 
-        Ok(paths)
+        drop(tx);
+        Ok(rx.into_iter().collect())
     })
 }
 
@@ -719,11 +862,13 @@ fn glob(
 ///     modified_before: Only include files modified before this unix timestamp.
 ///     created_after: Only include files created after this unix timestamp.
 ///     created_before: Only include files created before this unix timestamp.
+///     threads: Number of walker threads (default: number of CPUs).
 ///
 /// Returns:
 ///     DiskUsage object with .entries, .total_size, .total_files, .total_size_mb, .total_size_gb.
 #[pyfunction]
-#[pyo3(signature = (directory, depth=1, top=20, skip_hidden=false, extensions=None, names=None, min_size_mb=None, max_size_mb=None, modified_after=None, modified_before=None, created_after=None, created_before=None))]
+#[pyo3(signature = (directory, depth=1, top=20, skip_hidden=false, extensions=None, names=None, min_size_mb=None, max_size_mb=None, modified_after=None, modified_before=None, created_after=None, created_before=None, threads=None))]
+#[allow(clippy::too_many_arguments)]
 fn disk_usage(
     py: Python<'_>,
     directory: String,
@@ -738,84 +883,53 @@ fn disk_usage(
     modified_before: Option<f64>,
     created_after: Option<f64>,
     created_before: Option<f64>,
+    threads: Option<usize>,
 ) -> PyResult<DiskUsage> {
     validate_dir(&directory)?;
+    let filters = Filters::new(extensions, names, min_size_mb, max_size_mb, modified_after, modified_before, created_after, created_before);
 
     py.detach(|| {
         let base = Arc::new(PathBuf::from(&directory));
-        let exts = extensions.map(|e| normalize_exts(&e));
-        let names_lower: Option<Vec<String>> = names.map(|n| n.iter().map(|s| s.to_lowercase()).collect());
-        let min_bytes = mb_to_bytes(min_size_mb);
-        let max_bytes = mb_to_bytes(max_size_mb);
-        let has_time_filters = modified_after.is_some() || modified_before.is_some()
-            || created_after.is_some() || created_before.is_some();
-
         let folder_sizes: Arc<DashMap<PathBuf, (AtomicU64, AtomicUsize)>> = Arc::new(DashMap::new());
         let total_size = Arc::new(AtomicU64::new(0));
         let total_files = Arc::new(AtomicUsize::new(0));
 
-        let threads = thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-
-        let walker = WalkBuilder::new(base.as_path())
-            .follow_links(false)
-            .hidden(skip_hidden)
-            .git_ignore(false)
-            .git_global(false)
-            .git_exclude(false)
-            .ignore(false)
-            .parents(false)
-            .threads(threads)
-            .build_parallel();
+        let walker = build_walker(base.as_path(), skip_hidden, None, threads);
 
         walker.run(|| {
             let folder_sizes = Arc::clone(&folder_sizes);
             let total_size = Arc::clone(&total_size);
             let total_files = Arc::clone(&total_files);
             let base = Arc::clone(&base);
-            let exts = exts.clone();
-            let names_lower = names_lower.clone();
+            let filters = filters.clone();
 
             Box::new(move |entry| {
                 let entry = match entry {
                     Ok(e) => e,
-                    Err(_) => return ignore::WalkState::Continue,
+                    Err(_) => return WalkState::Continue,
                 };
 
                 let is_file = entry.file_type().map(|ft| ft.is_file()).unwrap_or(false);
                 if !is_file {
-                    return ignore::WalkState::Continue;
+                    return WalkState::Continue;
                 }
 
-                let path = entry.path();
-                let name = entry.file_name().to_string_lossy().to_string();
-                let name_lower = name.to_lowercase();
-
-                if !check_ext_filter(&name_lower, &exts) {
-                    return ignore::WalkState::Continue;
-                }
-                if !check_name_filter(&name_lower, &names_lower) {
-                    return ignore::WalkState::Continue;
+                // Cow borrow: no allocation unless a name filter is set
+                let name = entry.file_name().to_string_lossy();
+                if !filters.matches_name(&name) {
+                    return WalkState::Continue;
                 }
 
                 let metadata = entry.metadata().ok();
+                if !filters.matches_metadata(metadata.as_ref()) {
+                    return WalkState::Continue;
+                }
                 let size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
-
-                if !check_size_filters(size, min_bytes, max_bytes) {
-                    return ignore::WalkState::Continue;
-                }
-
-                if has_time_filters {
-                    if let Some(ref meta) = metadata {
-                        if !check_time_filters(meta, modified_after, modified_before, created_after, created_before) {
-                            return ignore::WalkState::Continue;
-                        }
-                    }
-                }
 
                 total_size.fetch_add(size, Ordering::Relaxed);
                 total_files.fetch_add(1, Ordering::Relaxed);
 
-                if let Some(bucket) = get_depth_path(path, base.as_path(), depth) {
+                if let Some(bucket) = get_depth_path(entry.path(), base.as_path(), depth) {
                     let counter = folder_sizes
                         .entry(bucket)
                         .or_insert_with(|| (AtomicU64::new(0), AtomicUsize::new(0)));
@@ -823,7 +937,7 @@ fn disk_usage(
                     counter.value().1.fetch_add(1, Ordering::Relaxed);
                 }
 
-                ignore::WalkState::Continue
+                WalkState::Continue
             })
         });
 

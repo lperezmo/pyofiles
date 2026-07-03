@@ -164,6 +164,21 @@ def test_find():
     found = {e.name for e in results}
     check("find combined name+ext", found == {"output.json"}, f"found={found}")
 
+    # limit stops early
+    results = pyofiles.find(root, extensions=[".py"], limit=2)
+    check("find limit=2 returns 2", len(results) == 2, f"count={len(results)}")
+
+    results = pyofiles.find(root, extensions=[".py"], limit=100)
+    check("find limit above match count returns all", len(results) == 3,
+          f"count={len(results)}")
+
+    results = pyofiles.find(root, extensions=[".py"], limit=0)
+    check("find limit=0 returns empty", len(results) == 0, f"count={len(results)}")
+
+    # threads parameter accepted
+    results = pyofiles.find(root, extensions=[".py"], threads=2)
+    check("find threads=2 works", len(results) == 3, f"count={len(results)}")
+
 
 def test_list_dir():
     section("list_dir")
@@ -334,6 +349,21 @@ def test_walk_name_and_size_filters():
           "large_file.bin" not in file_names,
           f"got {file_names}")
 
+    # when any filter is active, directories are excluded from results
+    entries = pyofiles.walk(root, extensions=[".py"])
+    check("walk with filters returns files only",
+          all(e.is_file for e in entries),
+          f"non-files: {[e.name for e in entries if not e.is_file]}")
+
+    # without filters, directories are included
+    entries = pyofiles.walk(root)
+    check("walk without filters includes dirs",
+          any(e.is_dir for e in entries))
+
+    # threads parameter accepted
+    entries = pyofiles.walk(root, extensions=[".py"], threads=2)
+    check("walk threads=2 works", len(entries) == 3, f"count={len(entries)}")
+
 
 def test_list_dir_filters():
     section("list_dir — filters")
@@ -465,6 +495,32 @@ def test_find_size_only():
     check("find min_size_mb=1 alone works", "large_file.bin" in found, f"found={found}")
 
 
+def test_index_collisions():
+    section("index — stem collisions are deterministic")
+
+    # Two files with the same stem and extension in different directories:
+    # the lexicographically smallest full path must win, every time.
+    (FIXTURES / "data" / "dup.py").write_text("# data copy\n")
+    (FIXTURES / "src" / "dup.py").write_text("# src copy\n")
+
+    expected = str(FIXTURES / "data" / "dup.py")
+    for run in range(5):
+        idx = pyofiles.index(str(FIXTURES), extensions=[".py"])
+        got = idx.get("dup", {}).get(".py")
+        if got != expected:
+            check(f"index collision keeps smallest path (run {run})", False,
+                  f"got {got}, expected {expected}")
+            return
+    check("index collision keeps smallest path across 5 runs", True)
+
+
+def test_list_dir_sorted():
+    section("list_dir — sorted output")
+    entries = pyofiles.list_dir(str(FIXTURES))
+    names = [e.name for e in entries]
+    check("list_dir returns sorted names", names == sorted(names), f"names={names}")
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -487,6 +543,8 @@ def main():
         test_index_filters()
         test_disk_usage_filters()
         test_find_size_only()
+        test_index_collisions()
+        test_list_dir_sorted()
     finally:
         teardown_fixtures()
 
