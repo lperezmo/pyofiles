@@ -1,4 +1,6 @@
-"""pyofiles CLI — fast, Rust-powered file operations from the command line."""
+"""pyofiles CLI - fast, Rust-powered file operations from the command line."""
+
+from __future__ import annotations
 
 import argparse
 import json
@@ -47,7 +49,7 @@ def parse_time(value: str) -> float:
         pass
 
     raise argparse.ArgumentTypeError(
-        f"cannot parse time '{value}' — use relative (7d, 24h), ISO date (2024-03-15), or unix timestamp"
+        f"cannot parse time '{value}' - use relative (7d, 24h), ISO date (2024-03-15), or unix timestamp"
     )
 
 
@@ -74,6 +76,17 @@ def format_time(ts: float | None) -> str:
     return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
 
 
+def json_indent() -> int | None:
+    """Pretty-print JSON on a terminal, compact when piped."""
+    return 2 if sys.stdout.isatty() else None
+
+
+def print_lines(lines):
+    """Write lines in a single buffered call instead of one write per line."""
+    if lines:
+        sys.stdout.write("\n".join(lines) + "\n")
+
+
 def print_entries(entries, as_json: bool = False, long: bool = False):
     """Print a list of FileEntry objects."""
     if as_json:
@@ -90,16 +103,17 @@ def print_entries(entries, as_json: bool = False, long: bool = False):
             }
             for e in entries
         ]
-        print(json.dumps(data, indent=2))
+        print(json.dumps(data, indent=json_indent()))
     elif long:
+        lines = []
         for e in entries:
             kind = "f" if e.is_file else "d"
             size = format_size(e.size) if e.is_file else "-"
             mod_time = format_time(e.modified)
-            print(f"{kind}  {size:>8s}  {mod_time}  {e.path}")
+            lines.append(f"{kind}  {size:>8s}  {mod_time}  {e.path}")
+        print_lines(lines)
     else:
-        for e in entries:
-            print(e.path)
+        print_lines([e.path for e in entries])
 
 
 def print_disk_usage(usage, as_json: bool = False):
@@ -120,11 +134,14 @@ def print_disk_usage(usage, as_json: bool = False):
                 for e in usage.entries
             ],
         }
-        print(json.dumps(data, indent=2))
+        print(json.dumps(data, indent=json_indent()))
     else:
-        for e in usage.entries:
-            print(f"{format_size(e.size):>10s}  {e.file_count:>6d} files  {e.path}")
-        print(f"\nTotal: {format_size(usage.total_size)} in {usage.total_files} files")
+        lines = [
+            f"{format_size(e.size):>10s}  {e.file_count:>6d} files  {e.path}"
+            for e in usage.entries
+        ]
+        lines.append(f"\nTotal: {format_size(usage.total_size)} in {usage.total_files} files")
+        print_lines(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +178,12 @@ def add_size_args(parser: argparse.ArgumentParser):
     parser.add_argument("--max-size", type=float, default=None, help="max file size in MB")
 
 
+def add_threads_arg(parser: argparse.ArgumentParser):
+    """Add walker thread count argument to a subparser."""
+    parser.add_argument("--threads", type=int, default=None, metavar="N",
+                        help="number of walker threads (default: number of CPUs)")
+
+
 # ---------------------------------------------------------------------------
 # Subcommands
 # ---------------------------------------------------------------------------
@@ -178,6 +201,7 @@ def cmd_walk(args):
         modified_before=args.modified_before,
         created_after=args.created_after,
         created_before=args.created_before,
+        threads=args.threads,
     )
     print_entries(entries, as_json=args.as_json, long=args.long)
 
@@ -195,6 +219,8 @@ def cmd_find(args):
         modified_before=args.modified_before,
         created_after=args.created_after,
         created_before=args.created_before,
+        limit=args.limit,
+        threads=args.threads,
     )
     print_entries(entries, as_json=args.as_json, long=args.long)
 
@@ -227,12 +253,12 @@ def cmd_glob(args):
         modified_before=args.modified_before,
         created_after=args.created_after,
         created_before=args.created_before,
+        threads=args.threads,
     )
     if args.as_json:
-        print(json.dumps(paths, indent=2))
+        print(json.dumps(paths, indent=json_indent()))
     else:
-        for p in paths:
-            print(p)
+        print_lines(paths)
 
 
 def cmd_index(args):
@@ -248,13 +274,16 @@ def cmd_index(args):
         modified_before=args.modified_before,
         created_after=args.created_after,
         created_before=args.created_before,
+        threads=args.threads,
     )
     if args.as_json:
-        print(json.dumps(idx, indent=2))
+        print(json.dumps(idx, indent=json_indent()))
     else:
+        lines = []
         for stem, exts in sorted(idx.items()):
             ext_list = ", ".join(f"{k} -> {os.path.basename(v)}" for k, v in sorted(exts.items()))
-            print(f"  {stem}: {ext_list}")
+            lines.append(f"  {stem}: {ext_list}")
+        print_lines(lines)
 
 
 def cmd_du(args):
@@ -271,6 +300,7 @@ def cmd_du(args):
         modified_before=args.modified_before,
         created_after=args.created_after,
         created_before=args.created_before,
+        threads=args.threads,
     )
     print_disk_usage(usage, as_json=args.as_json)
 
@@ -299,6 +329,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_name_args(p_walk)
     add_size_args(p_walk)
     add_time_args(p_walk)
+    add_threads_arg(p_walk)
     add_output_args(p_walk)
     p_walk.set_defaults(func=cmd_walk)
 
@@ -308,9 +339,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_find.add_argument("--ext", nargs="+", default=None, help="filter by extensions")
     p_find.add_argument("--skip-hidden", action="store_true", help="skip hidden files/dirs")
     p_find.add_argument("--max-depth", type=int, default=None, help="max recursion depth")
+    p_find.add_argument("--limit", type=int, default=None, metavar="N",
+                        help="stop after N matches")
     add_name_args(p_find)
     add_size_args(p_find)
     add_time_args(p_find)
+    add_threads_arg(p_find)
     add_output_args(p_find)
     p_find.set_defaults(func=cmd_find)
 
@@ -333,6 +367,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_glob.add_argument("--max-depth", type=int, default=None, help="max recursion depth")
     add_size_args(p_glob)
     add_time_args(p_glob)
+    add_threads_arg(p_glob)
     p_glob.add_argument("--json", dest="as_json", action="store_true", help="output as JSON")
     p_glob.set_defaults(func=cmd_glob)
 
@@ -345,6 +380,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_name_args(p_index)
     add_size_args(p_index)
     add_time_args(p_index)
+    add_threads_arg(p_index)
     p_index.add_argument("--json", dest="as_json", action="store_true", help="output as JSON")
     p_index.set_defaults(func=cmd_index)
 
@@ -358,6 +394,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_name_args(p_du)
     add_size_args(p_du)
     add_time_args(p_du)
+    add_threads_arg(p_du)
     p_du.add_argument("--json", dest="as_json", action="store_true", help="output as JSON")
     p_du.set_defaults(func=cmd_du)
 
@@ -369,6 +406,19 @@ def main():
     args = parser.parse_args()
     try:
         args.func(args)
+        sys.stdout.flush()
+    except BrokenPipeError:
+        # Downstream consumer (e.g. `| head`) closed the pipe: exit quietly.
+        # Point stdout at devnull so the interpreter's final flush does not
+        # raise a second error.
+        try:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, sys.stdout.fileno())
+        except OSError:
+            pass
+        sys.exit(141)
+    except KeyboardInterrupt:
+        sys.exit(130)
     except Exception as e:
         print(f"error: {e}", file=sys.stderr)
         sys.exit(1)
