@@ -1,6 +1,75 @@
 # CHANGELOG
 
 
+## v0.6.0 (2026-07-03)
+
+### Bug Fixes
+
+- Ship abi3 wheels and let Rust panics raise Python exceptions
+  ([`77c9c9c`](https://github.com/lperezmo/pyofiles/commit/77c9c9c6f0932f4eecb0794a7e1b1d0f26de3870))
+
+The release workflows only passed an interpreter list to the Linux builds, so Windows wheels were
+  published for a single Python version (cp312 for 0.5.0) and macOS for whatever the runner had
+  (cp314). Everyone else silently fell back to the sdist and needed a Rust toolchain. Build with
+  pyo3 abi3-py39 instead: one wheel per platform covers Python 3.9 and up, including future
+  versions.
+
+Also drop panic=abort from the release profile. In a cdylib loaded into a host interpreter it turned
+  any Rust panic into a hard abort of the whole Python process; without it PyO3 converts panics into
+  a catchable PanicException.
+
+Bump the trove classifier from Alpha to Beta.
+
+- **cli**: Restore Python 3.9 support, handle closed pipes, and batch output writes
+  ([`347eca7`](https://github.com/lperezmo/pyofiles/commit/347eca7921d4541ad495a8b4d0f22015383ba75f))
+
+PEP 604 annotations in cli.py made the console script crash at import on Python 3.9 even though the
+  package claims to support it. Add from __future__ import annotations.
+
+Exit cleanly on BrokenPipeError (e.g. piping to head) and on KeyboardInterrupt instead of printing
+  an error or a traceback.
+
+Write output lines in a single buffered call instead of one print per line, and only pretty-print
+  JSON when stdout is a terminal.
+
+### Chores
+
+- Document new options and behavior, exercise the CLI in CI
+  ([`e60c584`](https://github.com/lperezmo/pyofiles/commit/e60c584a0dc20800a5c4bec8eeb7d904b6221fc4))
+
+README: document limit and threads, the behavior notes (hidden files, creation time on Linux,
+  unreadable metadata, result ordering, index collisions), update the performance section, and drop
+  the downloads badge (it permanently rendered as rate limited).
+
+CI now runs the installed console script and python -m pyofiles across every matrix cell, which
+  would have caught the Python 3.9 CLI import crash.
+
+### Features
+
+- Parallel walk, find, glob and index with limit and threads options
+  ([`2a8f770`](https://github.com/lperezmo/pyofiles/commit/2a8f7703c05a83f0cb8a4c222820297917964ebc))
+
+Move walk, find, glob and index onto the ignore crate's parallel walker, the same engine disk_usage
+  already uses, and drop the jwalk dependency. Filtering and metadata reads now run on N worker
+  threads, and metadata comes from the directory read itself where the platform provides it (free on
+  Windows) instead of a second stat per file.
+
+On a 442k-file tree on Windows: walk 19.1s -> 0.38s, find by size 17.3s -> 0.31s, find by name 1.9s
+  -> 0.31s.
+
+New options: find(limit=N) stops the search as soon as N matches are found (a single-file lookup on
+  the same tree returns in ~1.5ms), and every recursive function takes threads=N to tune walker
+  parallelism, which helps on network drives.
+
+Also in this change: - glob starts walking at the pattern's literal directory prefix (src/**/*.py no
+  longer scans the whole tree) - walk returns only matching files when any filter is active instead
+  of interleaving every directory with the matches - index resolves stem collisions
+  deterministically by keeping the lexicographically smallest path - files whose metadata cannot be
+  read are excluded consistently when a size or time filter is active - list_dir results are sorted
+  by name, and skip_hidden honors the Windows hidden attribute everywhere - name and extension
+  filters no longer allocate per file when unset, which speeds up unfiltered disk_usage
+
+
 ## v0.5.0 (2026-04-28)
 
 ### Features
