@@ -1,6 +1,22 @@
 # CHANGELOG
 
 
+## v0.7.1 (2026-07-12)
+
+### Bug Fixes
+
+- Bump pyo3 to 0.29 to resolve two security advisories
+  ([`7aa5a7e`](https://github.com/lperezmo/pyofiles/commit/7aa5a7e36c447c858c7e8dacb11b4375c481eaec))
+
+Resolves GHSA-36hh-v3qg-5jq4 (high, out-of-bounds read in nth / nth_back for PyList and PyTuple
+  iterators) and GHSA-chgr-c6px-7xpp (medium, missing Sync bound on PyCFunction::new_closure
+  closures), both fixed in pyo3 0.29.0.
+
+Also opts FileEntry and SizeEntry out of the automatic FromPyObject impl via skip_from_py_object,
+  silencing the 0.29 deprecation warning; both types are output-only and never extracted from
+  Python.
+
+
 ## v0.7.0 (2026-07-03)
 
 ### Chores
