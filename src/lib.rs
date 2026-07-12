@@ -22,7 +22,7 @@ fn mft_unavailable() -> PyErr {
 // ─── Data Types ─────────────────────────────────────────────
 
 /// A file or directory entry returned by walk/find/list_dir.
-#[pyclass(frozen, get_all)]
+#[pyclass(frozen, get_all, skip_from_py_object)]
 #[derive(Clone, Debug)]
 pub struct FileEntry {
     pub path: String,
@@ -51,7 +51,7 @@ impl FileEntry {
 }
 
 /// A disk usage entry for a path.
-#[pyclass(frozen, get_all)]
+#[pyclass(frozen, get_all, skip_from_py_object)]
 #[derive(Clone, Debug)]
 pub struct SizeEntry {
     pub path: String,
