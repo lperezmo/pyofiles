@@ -8,7 +8,7 @@ name = "pyofiles"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.27", features = ["extension-module", "abi3-py39"] }
+pyo3 = { version = "0.29", features = ["extension-module", "abi3-py39"] }
 globset = "0.4"
 ignore = "0.4"
 dashmap = "6.1"
