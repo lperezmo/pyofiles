@@ -13,8 +13,10 @@
 //! directory references and filtered down to the requested subtree.
 
 use std::collections::HashMap;
+use std::ffi::c_void;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
+use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 use std::thread;
 
@@ -38,6 +40,28 @@ const MAX_CHUNKS: usize = 8;
 const RESERVED_RECORDS: u64 = 24;
 /// Seconds between the NT epoch (1601-01-01) and the unix epoch.
 const NT_TO_UNIX_SECS: f64 = 11_644_473_600.0;
+
+// CTL_CODE(FILE_DEVICE_DISK, 0x17, METHOD_BUFFERED, FILE_READ_ACCESS).
+const IOCTL_DISK_GET_LENGTH_INFO: u32 = 0x0007_405c;
+
+#[repr(C)]
+struct GetLengthInformation {
+    length: i64,
+}
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn DeviceIoControl(
+        device: *mut c_void,
+        control_code: u32,
+        in_buffer: *mut c_void,
+        in_buffer_size: u32,
+        out_buffer: *mut c_void,
+        out_buffer_size: u32,
+        bytes_returned: *mut u32,
+        overlapped: *mut c_void,
+    ) -> i32;
+}
 
 fn nt_to_unix(t: NtfsTime) -> Option<f64> {
     let nt = t.nt_timestamp();
@@ -339,18 +363,77 @@ fn unc_error(directory: &str) -> PyErr {
     ))
 }
 
-fn open_volume_reader(volume: &str) -> PyResult<VolumeReader> {
-    let file = File::open(volume).map_err(|e| {
+fn open_volume_file(volume: &str) -> PyResult<File> {
+    File::open(volume).map_err(|e| {
         PyOSError::new_err(format!(
             "Cannot open volume {} for MFT scanning: {}. {}.",
             volume,
             e,
             requirement()
         ))
-    })?;
+    })
+}
+
+fn reader_from_file(file: File) -> PyResult<VolumeReader> {
     let sector_reader = SectorReader::new(file, SECTOR_SIZE)
         .map_err(|e| PyOSError::new_err(format!("MFT scan failed: {}", e)))?;
     Ok(ChunkCache::new(sector_reader))
+}
+
+fn open_volume_reader(volume: &str) -> PyResult<VolumeReader> {
+    reader_from_file(open_volume_file(volume)?)
+}
+
+fn volume_length(file: &File) -> io::Result<u64> {
+    let mut info = GetLengthInformation { length: 0 };
+    let mut bytes_returned = 0u32;
+    // SAFETY: `file` is a live raw-volume handle, the output pointer refers
+    // to an initialized, correctly sized GET_LENGTH_INFORMATION-compatible
+    // buffer, and all unused pointer arguments are null.
+    let ok = unsafe {
+        DeviceIoControl(
+            file.as_raw_handle(),
+            IOCTL_DISK_GET_LENGTH_INFO,
+            std::ptr::null_mut(),
+            0,
+            (&mut info as *mut GetLengthInformation).cast(),
+            std::mem::size_of::<GetLengthInformation>() as u32,
+            &mut bytes_returned,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    u64::try_from(info.length)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid volume length"))
+}
+
+fn validated_record_count(mft_len: u64, record_size: u64, volume_len: u64) -> Result<u64, &'static str> {
+    if record_size == 0 {
+        return Err("MFT record size is zero");
+    }
+    if mft_len > volume_len {
+        return Err("declared MFT length exceeds the physical volume length");
+    }
+    if mft_len % record_size != 0 {
+        return Err("declared MFT length is not aligned to the record size");
+    }
+    Ok(mft_len / record_size)
+}
+
+fn select_child_record(candidates: &[(u64, String)], component: &str) -> Result<u64, &'static str> {
+    let mut exact = candidates.iter().filter(|(_, name)| name == component);
+    if let Some((frn, _)) = exact.next() {
+        if exact.next().is_none() {
+            return Ok(*frn);
+        }
+        return Err("multiple exact MFT directory matches");
+    }
+    if candidates.len() == 1 {
+        return Ok(candidates[0].0);
+    }
+    Err("ambiguous case-folded MFT directory match")
 }
 
 fn parse_record(ntfs: &Ntfs, fs: &mut VolumeReader, frn: u64) -> Option<RecordData> {
@@ -550,7 +633,16 @@ pub fn scan(directory: &str, threads: usize) -> PyResult<MftScan> {
 
     // Bootstrap on the main thread so open and parse errors are reported
     // clearly before any workers start.
-    let mut fs = open_volume_reader(&volume)?;
+    let volume_file = open_volume_file(&volume)?;
+    let volume_len = volume_length(&volume_file).map_err(|e| {
+        PyOSError::new_err(format!(
+            "Cannot determine the length of {}: {}. {}.",
+            volume,
+            e,
+            requirement()
+        ))
+    })?;
+    let mut fs = reader_from_file(volume_file)?;
     let ntfs = Ntfs::new(&mut fs).map_err(|e| {
         PyOSError::new_err(format!(
             "Cannot read {} as NTFS: {}. {}.",
@@ -579,7 +671,9 @@ pub fn scan(directory: &str, threads: usize) -> PyResult<MftScan> {
             requirement()
         ))
     })?;
-    let record_count = mft_len / record_size.max(1);
+    let record_count = validated_record_count(mft_len, record_size, volume_len).map_err(|e| {
+        PyOSError::new_err(format!("Cannot scan the MFT of {}: {}.", volume, e))
+    })?;
     drop(fs);
 
     // Parse all records in parallel over disjoint record ranges.
@@ -642,13 +736,17 @@ pub fn scan(directory: &str, threads: usize) -> PyResult<MftScan> {
     let root_frn = if prefix.len() == 2 {
         root_record
     } else {
-        let mut lookup: HashMap<(u64, String), u64> = HashMap::with_capacity(dirs.len());
+        let mut lookup: HashMap<(u64, String), Vec<(u64, String)>> =
+            HashMap::with_capacity(dirs.len());
         for (frn, info) in &dirs {
-            lookup.insert((info.parent, info.name.to_lowercase()), *frn);
+            lookup
+                .entry((info.parent, info.name.to_lowercase()))
+                .or_default()
+                .push((*frn, info.name.clone()));
         }
         let mut current = root_record;
         for component in prefix[3..].split('\\') {
-            current = *lookup
+            let candidates = lookup
                 .get(&(current, component.to_lowercase()))
                 .ok_or_else(|| {
                     PyOSError::new_err(format!(
@@ -658,6 +756,15 @@ pub fn scan(directory: &str, threads: usize) -> PyResult<MftScan> {
                         requirement()
                     ))
                 })?;
+            current = select_child_record(candidates, component).map_err(|e| {
+                PyOSError::new_err(format!(
+                    "Cannot locate '{}' unambiguously in the MFT of {}: {}. {}.",
+                    directory,
+                    volume,
+                    e,
+                    requirement()
+                ))
+            })?;
         }
         current
     };
@@ -733,4 +840,31 @@ pub fn scan(directory: &str, threads: usize) -> PyResult<MftScan> {
         root: display_root,
         entries,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn record_count_is_bounded_by_physical_volume() {
+        assert_eq!(validated_record_count(4096, 1024, 8192), Ok(4));
+        assert!(validated_record_count(8193, 1024, 8192).is_err());
+        assert!(validated_record_count(4097, 1024, 8192).is_err());
+        assert!(validated_record_count(4096, 0, 8192).is_err());
+    }
+
+    #[test]
+    fn exact_mft_name_wins_case_fold_collision() {
+        let candidates = vec![(10, "project".to_string()), (11, "Project".to_string())];
+        assert_eq!(select_child_record(&candidates, "Project"), Ok(11));
+        assert_eq!(select_child_record(&candidates, "PROJECT"),
+                   Err("ambiguous case-folded MFT directory match"));
+    }
+
+    #[test]
+    fn unique_folded_mft_name_remains_compatible() {
+        let candidates = vec![(10, "Project".to_string())];
+        assert_eq!(select_child_record(&candidates, "project"), Ok(10));
+    }
 }
