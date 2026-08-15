@@ -7,9 +7,13 @@ import os
 import sys
 import time
 import shutil
+import contextlib
+import io
 from pathlib import Path
+from types import SimpleNamespace
 
 import pyofiles
+from pyofiles.cli import escape_terminal_controls, print_entries
 
 # ---------------------------------------------------------------------------
 # Setup: build a fixture directory tree with known structure
@@ -521,6 +525,33 @@ def test_list_dir_sorted():
     check("list_dir returns sorted names", names == sorted(names), f"names={names}")
 
 
+def test_terminal_output_escaping():
+    section("terminal output escaping")
+    malicious_name = "forged\x1b]2;title\x07\rline.txt"
+    entries = [SimpleNamespace(
+        path=str(FIXTURES / malicious_name),
+        name=malicious_name,
+        is_file=True,
+        is_dir=False,
+        size=1,
+        extension="txt",
+        modified=None,
+        created=None,
+    )]
+    captured = io.StringIO()
+    with contextlib.redirect_stdout(captured):
+        print_entries(entries)
+    output = captured.getvalue()
+
+    check("CLI output contains no raw ESC", "\x1b" not in output, repr(output))
+    check("CLI output contains no raw BEL", "\x07" not in output, repr(output))
+    check("CLI output contains no raw CR", "\r" not in output, repr(output))
+    check("CLI output exposes visible escapes", r"\x1b]2;title\a\rline.txt" in output,
+          repr(output))
+    check("ordinary unicode remains unchanged",
+          escape_terminal_controls("café/資料.txt") == "café/資料.txt")
+
+
 def _is_windows_admin():
     """True when running elevated on Windows (e.g. GitHub windows runners)."""
     if sys.platform != "win32":
@@ -616,6 +647,7 @@ def main():
         test_find_size_only()
         test_index_collisions()
         test_list_dir_sorted()
+        test_terminal_output_escaping()
         test_mft()
     finally:
         teardown_fixtures()

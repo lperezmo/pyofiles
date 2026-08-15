@@ -1,7 +1,7 @@
 use pyo3::prelude::*;
 use pyo3::exceptions::{PyOSError, PyValueError};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -39,9 +39,9 @@ pub struct FileEntry {
 impl FileEntry {
     fn __repr__(&self) -> String {
         if self.is_file {
-            format!("FileEntry('{}', size={})", self.name, self.size)
+            format!("FileEntry({:?}, size={})", self.name, self.size)
         } else {
-            format!("FileEntry('{}', dir)", self.name)
+            format!("FileEntry({:?}, dir)", self.name)
         }
     }
 
@@ -938,6 +938,16 @@ fn literal_prefix_components(pattern: &str) -> Vec<&str> {
         if c.is_empty() || *c == "." || *c == ".." || c.contains(GLOB_META_CHARS) {
             break;
         }
+        // A glob component is data for the matcher, not an independent
+        // filesystem path. In particular, a Windows drive, root, UNC path,
+        // or backslash-separated parent path must never replace `base` when
+        // the prefix optimization constructs its walker root.
+        let mut path_components = Path::new(c).components();
+        if !matches!(path_components.next(), Some(Component::Normal(_)))
+            || path_components.next().is_some()
+        {
+            break;
+        }
         n += 1;
     }
     // A fully literal pattern still needs its last component matched as
@@ -998,6 +1008,9 @@ fn glob(
         let mut start = base.as_ref().clone();
         for component in &prefix {
             start.push(component);
+        }
+        if !start.starts_with(base.as_path()) {
+            return Ok(Vec::new());
         }
         if prefix_depth > 0 && !start.is_dir() {
             return Ok(Vec::new());
@@ -1196,4 +1209,44 @@ fn pyofiles(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(glob, m)?)?;
     m.add_function(wrap_pyfunction!(disk_usage, m)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn literal_glob_prefix_uses_only_normal_components() {
+        assert_eq!(literal_prefix_components("src/**/*.rs"), vec!["src"]);
+        assert!(literal_prefix_components("../outside/*.rs").is_empty());
+        assert!(literal_prefix_components("/outside/*.rs").is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn literal_glob_prefix_rejects_windows_root_syntax() {
+        assert!(literal_prefix_components(r"C:\\outside/*.txt").is_empty());
+        assert!(literal_prefix_components("C:/outside/*.txt").is_empty());
+        assert!(literal_prefix_components(r"\\\\server\\share\\*.txt").is_empty());
+        assert!(literal_prefix_components(r"folder\\..\\outside/*.txt").is_empty());
+    }
+
+    #[test]
+    fn file_entry_repr_escapes_terminal_controls() {
+        let entry = FileEntry {
+            path: "safe".to_string(),
+            name: "forged\u{1b}]2;title\u{7}".to_string(),
+            is_file: true,
+            is_dir: false,
+            size: 1,
+            extension: String::new(),
+            modified: None,
+            created: None,
+        };
+        let rendered = entry.__repr__();
+        assert!(!rendered.contains('\u{1b}'));
+        assert!(!rendered.contains('\u{7}'));
+        assert!(rendered.contains(r"\u{1b}"));
+        assert!(rendered.contains(r"\u{7}"));
+    }
 }

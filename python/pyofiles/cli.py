@@ -81,10 +81,33 @@ def json_indent() -> int | None:
     return 2 if sys.stdout.isatty() else None
 
 
+def escape_terminal_controls(value: str) -> str:
+    """Render terminal control characters as inert, visible escapes."""
+    named = {
+        "\a": r"\a",
+        "\b": r"\b",
+        "\t": r"\t",
+        "\n": r"\n",
+        "\v": r"\v",
+        "\f": r"\f",
+        "\r": r"\r",
+    }
+    escaped = []
+    for char in value:
+        codepoint = ord(char)
+        if char in named:
+            escaped.append(named[char])
+        elif codepoint <= 0x1F or 0x7F <= codepoint <= 0x9F:
+            escaped.append(f"\\x{codepoint:02x}")
+        else:
+            escaped.append(char)
+    return "".join(escaped)
+
+
 def print_lines(lines):
-    """Write lines in a single buffered call instead of one write per line."""
+    """Write terminal-safe lines in a single buffered call."""
     if lines:
-        sys.stdout.write("\n".join(lines) + "\n")
+        sys.stdout.write("\n".join(escape_terminal_controls(line) for line in lines) + "\n")
 
 
 def print_entries(entries, as_json: bool = False, long: bool = False):
@@ -140,7 +163,8 @@ def print_disk_usage(usage, as_json: bool = False):
             f"{format_size(e.size):>10s}  {e.file_count:>6d} files  {e.path}"
             for e in usage.entries
         ]
-        lines.append(f"\nTotal: {format_size(usage.total_size)} in {usage.total_files} files")
+        lines.append("")
+        lines.append(f"Total: {format_size(usage.total_size)} in {usage.total_files} files")
         print_lines(lines)
 
 
