@@ -26,7 +26,7 @@ pyofiles = "pyofiles.cli:main"
 
 
 [tool.maturin]
-features = ["pyo3/extension-module"]
+features = ["extension-module"]
 python-source = "python"
 
 [tool.semantic_release]

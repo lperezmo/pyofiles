@@ -39,6 +39,12 @@ now genuine pytest tests with asserts and per-test tmp_path fixtures (including 
 CLI parsing, time formats, output escaping, and boundary values). CI installs pytest and runs
 `python -m pytest tests/ -q` instead of invoking the file as a script.
 
+The pyo3 extension-module feature is now opt-in via a package feature of the same name instead of
+being always enabled, following the pyo3 recommendation for crates with Rust unit tests. Plain
+`cargo test` now links libpython, so unit tests link cleanly on every platform (newer toolchains
+defaulting to lld surfaced this); maturin builds enable it through pyproject.toml exactly as
+before, so wheels are unchanged.
+
 
 ## v0.7.1 (2026-07-12)
 
