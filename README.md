@@ -118,9 +118,10 @@ Time arguments (`--modified-after`, `--modified-before`, `--created-after`, `--c
 
 | Format | Example | Meaning |
 |--------|---------|---------|
-| Relative duration | `7d`, `24h`, `30m`, `1w` | ago from now |
+| Relative duration (case-insensitive) | `7d`, `24H`, `1.5d` | ago from now |
 | ISO date | `2024-03-15` | midnight on that date |
 | ISO datetime | `2024-03-15T10:30:00` | specific moment |
+| ISO datetime with offset | `2024-03-15T10:30:00+02:00`, `2024-03-15T10:30:00Z` | specific moment in the given timezone |
 | Unix timestamp | `1709251200` | raw epoch seconds |
 
 ### Filter availability

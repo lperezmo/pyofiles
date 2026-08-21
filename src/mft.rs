@@ -128,6 +128,12 @@ where
     R: Read + Seek,
 {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        // Zero-length reads must not touch the underlying storage: the
+        // sector-aligned read below fetches a padded sector, which could
+        // spuriously fail with UnexpectedEof near the end of the volume.
+        if buf.is_empty() {
+            return Ok(0);
+        }
         // We can only read from a sector boundary. Align down to find the
         // real read position and read enough extra bytes to cover both the
         // alignment difference and the alignment of the total length.
@@ -866,5 +872,29 @@ mod tests {
     fn unique_folded_mft_name_remains_compatible() {
         let candidates = vec![(10, "Project".to_string())];
         assert_eq!(select_child_record(&candidates, "project"), Ok(10));
+    }
+
+    #[test]
+    fn sector_reader_zero_length_read_is_a_noop() {
+        // Four sectors of data; note that reads of an exact multiple of
+        // the sector size intentionally fetch one extra sector (upstream
+        // behavior), so the backing storage must have room for it.
+        let data: Vec<u8> = (0u8..16).collect();
+        let mut reader = SectorReader::new(io::Cursor::new(data), 4).unwrap();
+
+        // Zero-length reads must succeed anywhere, including at EOF where
+        // the aligned read would run past the end of the backing storage.
+        assert_eq!(reader.seek(SeekFrom::Start(16)).unwrap(), 16);
+        assert_eq!(reader.read(&mut []).unwrap(), 0);
+        assert_eq!(reader.stream_position, 16);
+
+        // Regular aligned reads still work.
+        reader.seek(SeekFrom::Start(0)).unwrap();
+        let mut buf = [0u8; 4];
+        reader.read_exact(&mut buf).unwrap();
+        assert_eq!(buf, [0, 1, 2, 3]);
+        // Zero-length reads keep succeeding at EOF afterwards.
+        reader.seek(SeekFrom::Start(16)).unwrap();
+        assert_eq!(reader.read(&mut []).unwrap(), 0);
     }
 }

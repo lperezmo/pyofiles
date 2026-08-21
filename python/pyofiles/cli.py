@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pyofiles
 
@@ -23,34 +24,85 @@ def parse_time(value: str) -> float:
     """Parse a time value into a unix timestamp.
 
     Accepts:
-      - Relative durations: "7d", "24h", "30m", "1w", "3600s"
-      - ISO dates: "2024-03-15", "2024-03-15T10:30:00"
+      - Relative durations (case-insensitive): "7d", "24H", "30m", "1w", "3600s"
+      - ISO dates/datetimes, including UTC offsets: "2024-03-15",
+        "2024-03-15T10:30:00", "2024-03-15T10:30:00+02:00", "...Z"
       - Raw unix timestamps: "1709251200"
     """
     if not value:
         raise argparse.ArgumentTypeError("empty time value")
 
-    # Relative duration (e.g. "7d", "24h")
-    if value[-1] in _DURATION_UNITS and value[:-1].replace(".", "", 1).isdigit():
-        seconds = float(value[:-1]) * _DURATION_UNITS[value[-1]]
-        return time.time() - seconds
+    # Relative duration (e.g. "7d", "24H"); the unit is case-insensitive
+    # and the amount must be plain ASCII digits, optionally fractional.
+    unit = _DURATION_UNITS.get(value[-1].lower())
+    prefix = value[:-1]
+    if unit is not None and prefix.isascii() and prefix.replace(".", "", 1).isdigit():
+        return time.time() - float(prefix) * unit
 
-    # ISO date/datetime
-    for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"):
+    # ISO date/datetime. fromisoformat covers plain dates, missing seconds,
+    # fractional seconds, and UTC offsets on every supported Python, but it
+    # grew more lenient in newer versions, so bare digit strings skip it:
+    # they must always mean a unix timestamp, on every Python version. A
+    # trailing "Z" is only understood by 3.11+, so normalize it here.
+    if not value.isascii() or not value.isdigit():
+        normalized = value[:-1] + "+00:00" if value[-1] in "Zz" else value
+        parsed = None
         try:
-            return datetime.strptime(value, fmt).timestamp()
+            parsed = datetime.fromisoformat(normalized)
         except ValueError:
-            continue
+            # Keep accepting non-zero-padded dates ("2024-3-5"), which
+            # strptime allowed before fromisoformat became the parser.
+            for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"):
+                try:
+                    parsed = datetime.strptime(value, fmt)
+                    break
+                except ValueError:
+                    continue
+        if parsed is not None:
+            # fromisoformat drops the offset for date-only values; an
+            # explicit trailing "Z" still means UTC midnight there.
+            if parsed.tzinfo is None and value[-1] in "Zz":
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.timestamp()
 
-    # Raw unix timestamp
+    # Raw unix timestamp. NaN compares false against everything and would
+    # silently disable the filter, so non-finite values are rejected.
     try:
-        return float(value)
+        ts = float(value)
     except ValueError:
         pass
+    else:
+        if math.isfinite(ts):
+            return ts
+        raise argparse.ArgumentTypeError(f"time value '{value}' must be finite")
 
     raise argparse.ArgumentTypeError(
         f"cannot parse time '{value}' - use relative (7d, 24h), ISO date (2024-03-15), or unix timestamp"
     )
+
+
+def _strict_int(value: str) -> int:
+    """int() without its leniency for underscores and surrounding whitespace."""
+    digits = value[1:] if value.startswith("-") else value
+    if not (digits.isascii() and digits.isdigit()):
+        raise argparse.ArgumentTypeError(f"'{value}' is not an integer")
+    return int(value)
+
+
+def non_negative_int(value: str) -> int:
+    """argparse type: an integer >= 0."""
+    ivalue = _strict_int(value)
+    if ivalue < 0:
+        raise argparse.ArgumentTypeError(f"'{value}' must be >= 0")
+    return ivalue
+
+
+def positive_int(value: str) -> int:
+    """argparse type: an integer >= 1."""
+    ivalue = _strict_int(value)
+    if ivalue < 1:
+        raise argparse.ArgumentTypeError(f"'{value}' must be >= 1")
+    return ivalue
 
 
 # ---------------------------------------------------------------------------
@@ -204,7 +256,7 @@ def add_size_args(parser: argparse.ArgumentParser):
 
 def add_threads_arg(parser: argparse.ArgumentParser):
     """Add walker thread count argument to a subparser."""
-    parser.add_argument("--threads", type=int, default=None, metavar="N",
+    parser.add_argument("--threads", type=positive_int, default=None, metavar="N",
                         help="number of walker threads (default: number of CPUs)")
 
 
@@ -359,7 +411,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_walk.add_argument("directory", nargs="?", default=".", help="directory to walk (default: .)")
     p_walk.add_argument("--ext", nargs="+", default=None, help="filter by extensions (e.g. .py .rs)")
     p_walk.add_argument("--skip-hidden", action="store_true", help="skip hidden files/dirs")
-    p_walk.add_argument("--max-depth", type=int, default=None, help="max recursion depth")
+    p_walk.add_argument("--max-depth", type=non_negative_int, default=None, metavar="N",
+                        help="max recursion depth")
     add_name_args(p_walk)
     add_size_args(p_walk)
     add_time_args(p_walk)
@@ -373,8 +426,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_find.add_argument("directory", nargs="?", default=".", help="directory to search (default: .)")
     p_find.add_argument("--ext", nargs="+", default=None, help="filter by extensions")
     p_find.add_argument("--skip-hidden", action="store_true", help="skip hidden files/dirs")
-    p_find.add_argument("--max-depth", type=int, default=None, help="max recursion depth")
-    p_find.add_argument("--limit", type=int, default=None, metavar="N",
+    p_find.add_argument("--max-depth", type=non_negative_int, default=None, metavar="N",
+                        help="max recursion depth")
+    p_find.add_argument("--limit", type=non_negative_int, default=None, metavar="N",
                         help="stop after N matches")
     add_name_args(p_find)
     add_size_args(p_find)
@@ -400,7 +454,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_glob.add_argument("directory", nargs="?", default=".", help="root directory (default: .)")
     p_glob.add_argument("pattern", help="glob pattern (e.g. '**/*.py')")
     p_glob.add_argument("--skip-hidden", action="store_true", help="skip hidden files")
-    p_glob.add_argument("--max-depth", type=int, default=None, help="max recursion depth")
+    p_glob.add_argument("--max-depth", type=non_negative_int, default=None, metavar="N",
+                        help="max recursion depth")
     add_size_args(p_glob)
     add_time_args(p_glob)
     add_threads_arg(p_glob)
@@ -412,7 +467,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_index.add_argument("directory", nargs="?", default=".", help="directory to index (default: .)")
     p_index.add_argument("--ext", nargs="+", required=True, help="extensions to index (e.g. .py .pyi .pyc)")
     p_index.add_argument("--skip-hidden", action="store_true", help="skip hidden files")
-    p_index.add_argument("--max-depth", type=int, default=None, help="max recursion depth")
+    p_index.add_argument("--max-depth", type=non_negative_int, default=None, metavar="N",
+                         help="max recursion depth")
     add_name_args(p_index)
     add_size_args(p_index)
     add_time_args(p_index)
@@ -423,8 +479,10 @@ def build_parser() -> argparse.ArgumentParser:
     # -- du --
     p_du = sub.add_parser("du", help="disk usage analysis")
     p_du.add_argument("directory", nargs="?", default=".", help="directory to analyze (default: .)")
-    p_du.add_argument("--depth", type=int, default=1, help="directory depth for grouping (default: 1)")
-    p_du.add_argument("--top", type=int, default=20, help="number of top entries (default: 20)")
+    p_du.add_argument("--depth", type=non_negative_int, default=1, metavar="N",
+                      help="directory depth for grouping, 0 for totals only (default: 1)")
+    p_du.add_argument("--top", type=non_negative_int, default=20, metavar="N",
+                      help="number of top entries, 0 to omit them (default: 20)")
     p_du.add_argument("--skip-hidden", action="store_true", help="skip hidden files/dirs")
     p_du.add_argument("--ext", nargs="+", default=None, help="filter by extensions")
     add_name_args(p_du)

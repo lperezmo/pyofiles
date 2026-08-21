@@ -1,6 +1,40 @@
 # CHANGELOG
 
 
+## Unreleased
+
+### Bug Fixes
+
+- Validate numeric CLI arguments and harden time parsing
+  (tests-pytest-and-cli-hardening)
+
+`--max-depth` and `--limit` are validated by argparse as integers >= 0 (--limit 0 and
+--max-depth 0 stay meaningful: no matches, and no recursion below the root), du's --depth and
+--top keep accepting 0 for totals-only output, and --threads must now be >= 1 instead of
+silently falling back to the default. Underscore forms like "1_000" are rejected.
+
+parse_time now accepts case-insensitive duration units ("7D", "24H") and timezone-aware ISO
+datetimes ("2024-03-15T10:30:00+02:00" or a trailing "Z") on all supported Python versions; a
+date-only value with a trailing "Z" means UTC midnight, and previously-accepted lenient forms
+like "2024-3-5" keep working. Bare digit strings always mean unix seconds regardless of Python
+version (fromisoformat grew more lenient in 3.11+ and would otherwise reinterpret "20240101" as
+a date), and non-finite values (nan, inf) are rejected instead of silently disabling the time
+filters.
+
+The MFT sector reader no longer issues a padded sector read for zero-length requests, which
+could spuriously report UnexpectedEof near the end of a volume.
+
+### Testing
+
+- Convert the Python suite to real pytest tests
+
+tests/test_pyofiles.py previously used a print-only check harness: under pytest every test passed
+trivially because nothing asserted, so only the script-mode run in CI caught failures. The suite is
+now genuine pytest tests with asserts and per-test tmp_path fixtures (including new coverage for
+CLI parsing, time formats, output escaping, and boundary values). CI installs pytest and runs
+`python -m pytest tests/ -q` instead of invoking the file as a script.
+
+
 ## v0.7.1 (2026-07-12)
 
 ### Bug Fixes
