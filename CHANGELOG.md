@@ -21,6 +21,11 @@ version (fromisoformat grew more lenient in 3.11+ and would otherwise reinterpre
 a date), and non-finite values (nan, inf) are rejected instead of silently disabling the time
 filters.
 
+Size filters get the same treatment in the extension itself, so the Python API is covered too:
+min_size_mb/max_size_mb values that are NaN, infinite, or negative raise ValueError instead of
+silently disabling the bound (NaN compares false against everything; a negative cast clamped
+to zero).
+
 The MFT sector reader no longer issues a padded sector read for zero-length requests, which
 could spuriously report UnexpectedEof near the end of a volume.
 

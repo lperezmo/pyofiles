@@ -81,6 +81,17 @@ def parse_time(value: str) -> float:
     )
 
 
+def finite_float(value: str) -> float:
+    """argparse type: a finite float (NaN would silently disable size bounds)."""
+    try:
+        fvalue = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"'{value}' is not a number")
+    if not math.isfinite(fvalue):
+        raise argparse.ArgumentTypeError(f"'{value}' must be finite")
+    return fvalue
+
+
 def _strict_int(value: str) -> int:
     """int() without its leniency for underscores and surrounding whitespace."""
     digits = value[1:] if value.startswith("-") else value
@@ -250,8 +261,8 @@ def add_name_args(parser: argparse.ArgumentParser):
 
 def add_size_args(parser: argparse.ArgumentParser):
     """Add size filter arguments to a subparser."""
-    parser.add_argument("--min-size", type=float, default=None, help="min file size in MB")
-    parser.add_argument("--max-size", type=float, default=None, help="max file size in MB")
+    parser.add_argument("--min-size", type=finite_float, default=None, help="min file size in MB")
+    parser.add_argument("--max-size", type=finite_float, default=None, help="max file size in MB")
 
 
 def add_threads_arg(parser: argparse.ArgumentParser):

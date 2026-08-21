@@ -160,6 +160,20 @@ def test_find_requires_a_filter(tree: Path):
         pyofiles.find(str(tree))
 
 
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf"), -1.0])
+def test_size_filters_reject_non_finite_and_negative(bad, tree: Path):
+    for call in (
+        lambda: pyofiles.walk(str(tree), min_size_mb=bad),
+        lambda: pyofiles.find(str(tree), max_size_mb=bad),
+        lambda: pyofiles.list_dir(str(tree), min_size_mb=bad),
+        lambda: pyofiles.glob(str(tree), "**/*", min_size_mb=bad),
+        lambda: pyofiles.index(str(tree), extensions=[".py"], max_size_mb=bad),
+        lambda: pyofiles.disk_usage(str(tree), min_size_mb=bad),
+    ):
+        with pytest.raises(ValueError, match="finite, non-negative"):
+            call()
+
+
 # ---------------------------------------------------------------------------
 # list_dir
 # ---------------------------------------------------------------------------
@@ -424,6 +438,9 @@ BAD_NUMERIC_ARGS = [
     ["du", ".", "--top", "-1"],
     ["du", ".", "--top", "abc"],
     ["du", ".", "--threads", "x"],
+    ["find", ".", "--min-size", "nan"],
+    ["find", ".", "--max-size", "inf"],
+    ["walk", ".", "--min-size", "abc"],
 ]
 
 # (argv, attribute, expected parsed value) -- exact equality so a dropped
@@ -439,6 +456,8 @@ GOOD_NUMERIC_ARGS = [
     (["du", ".", "--top", "0"], "top", 0),
     (["du", ".", "--depth", "4"], "depth", 4),
     (["du", ".", "--top", "5"], "top", 5),
+    (["find", ".", "--min-size", "0"], "min_size", 0.0),
+    (["find", ".", "--max-size", "1.5"], "max_size", 1.5),
 ]
 
 
