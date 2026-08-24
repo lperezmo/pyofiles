@@ -1,6 +1,17 @@
 # CHANGELOG
 
 
+## v0.7.2 (2026-08-24)
+
+### Bug Fixes
+
+- **ci**: Define least-privilege release permissions
+  ([`868284b`](https://github.com/lperezmo/pyofiles/commit/868284b38665952a327a294ccb7383770d176c86))
+
+- **ci**: Define least-privilege workflow permissions
+  ([`13e3902`](https://github.com/lperezmo/pyofiles/commit/13e390266e87dd3111a4cbf03911207cfccb1142))
+
+
 ## v0.7.1 (2026-07-12)
 
 ### Bug Fixes
