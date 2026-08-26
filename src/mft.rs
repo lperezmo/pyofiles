@@ -118,8 +118,14 @@ where
         n / self.sector_size as u64 * self.sector_size as u64
     }
 
-    fn align_up_to_sector_size(&self, n: u64) -> u64 {
-        self.align_down_to_sector_size(n) + self.sector_size as u64
+    fn align_up_to_sector_size(&self, n: usize) -> Option<usize> {
+        let sector_size = self.sector_size;
+        let remainder = n % sector_size;
+        if remainder == 0 {
+            Some(n)
+        } else {
+            n.checked_add(sector_size - remainder)
+        }
     }
 }
 
@@ -139,8 +145,12 @@ where
         // alignment difference and the alignment of the total length.
         let aligned_position = self.align_down_to_sector_size(self.stream_position);
         let start = (self.stream_position - aligned_position) as usize;
-        let end = start + buf.len();
-        let aligned_bytes_to_read = self.align_up_to_sector_size(end as u64) as usize;
+        let end = start.checked_add(buf.len()).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "sector read length overflow")
+        })?;
+        let aligned_bytes_to_read = self.align_up_to_sector_size(end).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "aligned sector read length overflow")
+        })?;
 
         self.temp_buf.resize(aligned_bytes_to_read, 0);
         self.inner.seek(SeekFrom::Start(aligned_position))?;
@@ -876,9 +886,7 @@ mod tests {
 
     #[test]
     fn sector_reader_zero_length_read_is_a_noop() {
-        // Four sectors of data; note that reads of an exact multiple of
-        // the sector size intentionally fetch one extra sector (upstream
-        // behavior), so the backing storage must have room for it.
+        // Four sectors of data.
         let data: Vec<u8> = (0u8..16).collect();
         let mut reader = SectorReader::new(io::Cursor::new(data), 4).unwrap();
 
@@ -888,11 +896,11 @@ mod tests {
         assert_eq!(reader.read(&mut []).unwrap(), 0);
         assert_eq!(reader.stream_position, 16);
 
-        // Regular aligned reads still work.
-        reader.seek(SeekFrom::Start(0)).unwrap();
+        // An exact-sector read at the end must not fetch a fifth sector.
+        reader.seek(SeekFrom::Start(12)).unwrap();
         let mut buf = [0u8; 4];
         reader.read_exact(&mut buf).unwrap();
-        assert_eq!(buf, [0, 1, 2, 3]);
+        assert_eq!(buf, [12, 13, 14, 15]);
         // Zero-length reads keep succeeding at EOF afterwards.
         reader.seek(SeekFrom::Start(16)).unwrap();
         assert_eq!(reader.read(&mut []).unwrap(), 0);

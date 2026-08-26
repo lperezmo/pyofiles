@@ -362,9 +362,12 @@ Returned by `disk_usage`.
   is `None` there.
 - **Unreadable metadata**: when a size or time filter is active, files whose
   metadata cannot be read are excluded.
-- **Size filters**: `min_size_mb`/`max_size_mb` must be finite and
-  non-negative; NaN, infinite, or negative values raise `ValueError` instead
-  of silently disabling the bound.
+- **Size filters**: `min_size_mb`/`max_size_mb` must be finite, non-negative,
+  and representable in bytes; invalid values raise `ValueError` instead of
+  silently disabling or clamping the bound.
+- **Time filters**: `modified_after`/`modified_before` and
+  `created_after`/`created_before` must be finite; NaN and infinite values
+  raise `ValueError`.
 - **Result order**: `walk`, `find`, and `glob` run in parallel and return results
   in no particular order. `list_dir` is sorted by name.
 

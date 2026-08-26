@@ -11,23 +11,26 @@
 `--max-depth` and `--limit` are validated by argparse as integers >= 0 (--limit 0 and
 --max-depth 0 stay meaningful: no matches, and no recursion below the root), du's --depth and
 --top keep accepting 0 for totals-only output, and --threads must now be >= 1 instead of
-silently falling back to the default. Underscore forms like "1_000" are rejected.
+silently falling back to the default. Underscore forms like "1_000" and integers too large for
+the native extension are rejected during argument parsing.
 
 parse_time now accepts case-insensitive duration units ("7D", "24H") and timezone-aware ISO
 datetimes ("2024-03-15T10:30:00+02:00" or a trailing "Z") on all supported Python versions; a
 date-only value with a trailing "Z" means UTC midnight, and previously-accepted lenient forms
 like "2024-3-5" keep working. Bare digit strings always mean unix seconds regardless of Python
 version (fromisoformat grew more lenient in 3.11+ and would otherwise reinterpret "20240101" as
-a date), and non-finite values (nan, inf) are rejected instead of silently disabling the time
-filters.
+a date), and non-finite values (nan, inf), including overflowing relative durations, are rejected
+instead of silently disabling the time filters. The extension validates time bounds too, so direct
+Python API calls cannot bypass that protection.
 
 Size filters get the same treatment in the extension itself, so the Python API is covered too:
-min_size_mb/max_size_mb values that are NaN, infinite, or negative raise ValueError instead of
-silently disabling the bound (NaN compares false against everything; a negative cast clamped
-to zero).
+min_size_mb/max_size_mb values that are NaN, infinite, negative, or too large to represent in
+bytes raise ValueError instead of silently disabling or clamping the bound. Negative CLI values
+are rejected during argument parsing as well.
 
-The MFT sector reader no longer issues a padded sector read for zero-length requests, which
-could spuriously report UnexpectedEof near the end of a volume.
+The MFT sector reader no longer touches storage for zero-length requests or reads an extra sector
+when the requested range ends exactly on a sector boundary. Both cases could spuriously report
+UnexpectedEof near the end of a volume.
 
 ### Testing
 

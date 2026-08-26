@@ -171,14 +171,33 @@ fn check_size_filters(size: u64, min_bytes: Option<u64>, max_bytes: Option<u64>)
 }
 
 /// Megabytes to bytes. NaN would silently disable the filter (NaN
-/// comparisons are always false) and a negative cast would clamp to 0,
-/// so both are rejected instead.
+/// comparisons are always false), a negative cast would clamp to 0, and
+/// an overflowing positive cast would clamp to u64::MAX. Reject all three.
 fn mb_to_bytes(mb: Option<f64>) -> PyResult<Option<u64>> {
     match mb {
         None => Ok(None),
-        Some(v) if v.is_finite() && v >= 0.0 => Ok(Some((v * 1024.0 * 1024.0) as u64)),
+        Some(v) if v.is_finite() && v >= 0.0 => {
+            let bytes = v * 1024.0 * 1024.0;
+            if bytes < u64::MAX as f64 {
+                Ok(Some(bytes as u64))
+            } else {
+                Err(PyValueError::new_err(format!(
+                    "size filter must be representable in bytes, got {v} megabytes"
+                )))
+            }
+        }
         Some(v) => Err(PyValueError::new_err(format!(
             "size filter must be a finite, non-negative number of megabytes, got {v}"
+        ))),
+    }
+}
+
+fn finite_time_filter(value: Option<f64>) -> PyResult<Option<f64>> {
+    match value {
+        None => Ok(None),
+        Some(v) if v.is_finite() => Ok(Some(v)),
+        Some(v) => Err(PyValueError::new_err(format!(
+            "time filter must be finite, got {v}"
         ))),
     }
 }
@@ -275,10 +294,10 @@ impl Filters {
             names: names.map(|n| n.iter().map(|s| s.to_lowercase()).collect()),
             min_bytes: mb_to_bytes(min_size_mb)?,
             max_bytes: mb_to_bytes(max_size_mb)?,
-            modified_after,
-            modified_before,
-            created_after,
-            created_before,
+            modified_after: finite_time_filter(modified_after)?,
+            modified_before: finite_time_filter(modified_before)?,
+            created_after: finite_time_filter(created_after)?,
+            created_before: finite_time_filter(created_before)?,
         })
     }
 
@@ -1238,6 +1257,16 @@ mod tests {
         assert!(mb_to_bytes(Some(f64::NAN)).is_err());
         assert!(mb_to_bytes(Some(f64::INFINITY)).is_err());
         assert!(mb_to_bytes(Some(-0.001)).is_err());
+        assert!(mb_to_bytes(Some(1e308)).is_err());
+    }
+
+    #[test]
+    fn time_filters_reject_non_finite_values() {
+        assert_eq!(finite_time_filter(None).unwrap(), None);
+        assert_eq!(finite_time_filter(Some(1.5)).unwrap(), Some(1.5));
+        assert!(finite_time_filter(Some(f64::NAN)).is_err());
+        assert!(finite_time_filter(Some(f64::INFINITY)).is_err());
+        assert!(finite_time_filter(Some(f64::NEG_INFINITY)).is_err());
     }
 
     #[cfg(windows)]

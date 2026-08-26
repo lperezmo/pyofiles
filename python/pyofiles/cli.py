@@ -18,6 +18,7 @@ import pyofiles
 # ---------------------------------------------------------------------------
 
 _DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+_MAX_SIZE_MB = float(1 << 44)  # 2**64 bytes
 
 
 def parse_time(value: str) -> float:
@@ -37,7 +38,11 @@ def parse_time(value: str) -> float:
     unit = _DURATION_UNITS.get(value[-1].lower())
     prefix = value[:-1]
     if unit is not None and prefix.isascii() and prefix.replace(".", "", 1).isdigit():
-        return time.time() - float(prefix) * unit
+        amount = float(prefix)
+        seconds = amount * unit
+        if not math.isfinite(seconds):
+            raise argparse.ArgumentTypeError(f"time value '{value}' must be finite")
+        return time.time() - seconds
 
     # ISO date/datetime. fromisoformat covers plain dates, missing seconds,
     # fractional seconds, and UTC offsets on every supported Python, but it
@@ -81,14 +86,18 @@ def parse_time(value: str) -> float:
     )
 
 
-def finite_float(value: str) -> float:
-    """argparse type: a finite float (NaN would silently disable size bounds)."""
+def non_negative_float(value: str) -> float:
+    """argparse type: a finite float >= 0."""
     try:
         fvalue = float(value)
     except ValueError:
         raise argparse.ArgumentTypeError(f"'{value}' is not a number")
     if not math.isfinite(fvalue):
         raise argparse.ArgumentTypeError(f"'{value}' must be finite")
+    if fvalue < 0:
+        raise argparse.ArgumentTypeError(f"'{value}' must be >= 0")
+    if fvalue >= _MAX_SIZE_MB:
+        raise argparse.ArgumentTypeError(f"'{value}' is too large to represent in bytes")
     return fvalue
 
 
@@ -97,7 +106,10 @@ def _strict_int(value: str) -> int:
     digits = value[1:] if value.startswith("-") else value
     if not (digits.isascii() and digits.isdigit()):
         raise argparse.ArgumentTypeError(f"'{value}' is not an integer")
-    return int(value)
+    ivalue = int(value)
+    if ivalue > sys.maxsize:
+        raise argparse.ArgumentTypeError(f"'{value}' must be <= {sys.maxsize}")
+    return ivalue
 
 
 def non_negative_int(value: str) -> int:
@@ -261,8 +273,8 @@ def add_name_args(parser: argparse.ArgumentParser):
 
 def add_size_args(parser: argparse.ArgumentParser):
     """Add size filter arguments to a subparser."""
-    parser.add_argument("--min-size", type=finite_float, default=None, help="min file size in MB")
-    parser.add_argument("--max-size", type=finite_float, default=None, help="max file size in MB")
+    parser.add_argument("--min-size", type=non_negative_float, default=None, help="min file size in MB")
+    parser.add_argument("--max-size", type=non_negative_float, default=None, help="max file size in MB")
 
 
 def add_threads_arg(parser: argparse.ArgumentParser):

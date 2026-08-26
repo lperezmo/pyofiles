@@ -174,6 +174,25 @@ def test_size_filters_reject_non_finite_and_negative(bad, tree: Path):
             call()
 
 
+def test_size_filters_reject_unrepresentable_values(tree: Path):
+    with pytest.raises(ValueError, match="representable"):
+        pyofiles.walk(str(tree), min_size_mb=1e308)
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_time_filters_reject_non_finite_values(bad, tree: Path):
+    for call in (
+        lambda: pyofiles.walk(str(tree), modified_after=bad),
+        lambda: pyofiles.find(str(tree), names=["readme"], modified_before=bad),
+        lambda: pyofiles.list_dir(str(tree), created_after=bad),
+        lambda: pyofiles.glob(str(tree), "**/*", created_before=bad),
+        lambda: pyofiles.index(str(tree), extensions=[".py"], modified_after=bad),
+        lambda: pyofiles.disk_usage(str(tree), modified_before=bad),
+    ):
+        with pytest.raises(ValueError, match="time filter must be finite"):
+            call()
+
+
 # ---------------------------------------------------------------------------
 # list_dir
 # ---------------------------------------------------------------------------
@@ -411,6 +430,10 @@ class TestParseTime:
         with pytest.raises(argparse.ArgumentTypeError):
             parse_time(value)
 
+    def test_overflowing_duration_rejected(self):
+        with pytest.raises(argparse.ArgumentTypeError, match="finite"):
+            parse_time("9" * 400 + "d")
+
     @pytest.mark.parametrize("value", ["", "garbage", "2024-13-45", "7x",
                                        "1_000d", "１２d", "²d"])
     def test_invalid_values(self, value):
@@ -426,6 +449,7 @@ BAD_NUMERIC_ARGS = [
     ["walk", ".", "--max-depth", "-1"],
     ["walk", ".", "--max-depth", "abc"],
     ["walk", ".", "--max-depth", "1_000"],
+    ["walk", ".", "--max-depth", "9" * 400],
     ["walk", ".", "--threads", "0"],
     ["walk", ".", "--threads", "-4"],
     ["find", ".", "--max-depth", "-3"],
@@ -440,6 +464,8 @@ BAD_NUMERIC_ARGS = [
     ["du", ".", "--threads", "x"],
     ["find", ".", "--min-size", "nan"],
     ["find", ".", "--max-size", "inf"],
+    ["find", ".", "--min-size", "-1"],
+    ["find", ".", "--min-size", "1e308"],
     ["walk", ".", "--min-size", "abc"],
 ]
 
