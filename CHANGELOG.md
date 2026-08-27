@@ -1,63 +1,75 @@
 # CHANGELOG
 
 
-## Unreleased
+## v0.7.3 (2026-08-27)
 
 ### Bug Fixes
 
-- Validate numeric CLI arguments and harden time parsing
-  (tests-pytest-and-cli-hardening)
-
-`--max-depth` and `--limit` are validated by argparse as integers >= 0 (--limit 0 and
---max-depth 0 stay meaningful: no matches, and no recursion below the root), du's --depth and
---top keep accepting 0 for totals-only output, and --threads must now be >= 1 instead of
-silently falling back to the default. Underscore forms like "1_000" and integers too large for
-the native extension are rejected during argument parsing.
-
-parse_time now accepts case-insensitive duration units ("7D", "24H") and timezone-aware ISO
-datetimes ("2024-03-15T10:30:00+02:00" or a trailing "Z") on all supported Python versions; a
-date-only value with a trailing "Z" means UTC midnight, and previously-accepted lenient forms
-like "2024-3-5" keep working. Bare digit strings always mean unix seconds regardless of Python
-version (fromisoformat grew more lenient in 3.11+ and would otherwise reinterpret "20240101" as
-a date), and non-finite values (nan, inf), including overflowing relative durations, are rejected
-instead of silently disabling the time filters. The extension validates time bounds too, so direct
-Python API calls cannot bypass that protection.
-
-Size filters get the same treatment in the extension itself, so the Python API is covered too:
-min_size_mb/max_size_mb values that are NaN, infinite, negative, or too large to represent in
-bytes raise ValueError instead of silently disabling or clamping the bound. Negative CLI values
-are rejected during argument parsing as well.
-
-The MFT sector reader no longer touches storage for zero-length requests or reads an extra sector
-when the requested range ends exactly on a sector boundary. Both cases could spuriously report
-UnexpectedEof near the end of a volume.
+- **ci**: Pin GitPython for semantic release
+  ([`ced429f`](https://github.com/lperezmo/pyofiles/commit/ced429fe33d3b4113aa81ca2d74d03cc55a76545))
 
 ### Testing
 
-- Convert the Python suite to real pytest tests
-
-tests/test_pyofiles.py previously used a print-only check harness: under pytest every test passed
-trivially because nothing asserted, so only the script-mode run in CI caught failures. The suite is
-now genuine pytest tests with asserts and per-test tmp_path fixtures (including new coverage for
-CLI parsing, time formats, output escaping, and boundary values). CI installs pytest and runs
-`python -m pytest tests/ -q` instead of invoking the file as a script.
-
-The pyo3 extension-module feature is now opt-in via a package feature of the same name instead of
-being always enabled, following the pyo3 recommendation for crates with Rust unit tests. Plain
-`cargo test` now links libpython, so unit tests link cleanly on every platform (newer toolchains
-defaulting to lld surfaced this); maturin builds enable it through pyproject.toml exactly as
-before, so wheels are unchanged.
+- Rename smoke checks as integration tests
+  ([`11578af`](https://github.com/lperezmo/pyofiles/commit/11578af029561b37d859ce38cc02325306e5280c))
 
 
 ## v0.7.2 (2026-08-24)
 
 ### Bug Fixes
 
+- Gate the extension-module feature so cargo test links libpython
+  ([`3efd375`](https://github.com/lperezmo/pyofiles/commit/3efd3757b4c955c21513b34b23149ed48dcfefdf))
+
+extension-module was enabled unconditionally on the pyo3 dependency, so the cargo test binary never
+  linked libpython. That worked only while linker dead-stripping happened to drop every pyo3 runtime
+  reference from the test executable; newer toolchains defaulting to lld (and the new mb_to_bytes
+  unit test touching PyErr) surfaced undefined Py* symbols on Linux. Make it an opt-in package
+  feature per the pyo3 recommendation: plain cargo test links libpython and works everywhere, while
+  maturin enables it via pyproject.toml exactly as before, leaving wheels unchanged.
+
+- Harden filter validation and aligned MFT reads
+  ([`6210027`](https://github.com/lperezmo/pyofiles/commit/6210027c25d0a4e185a443faff956d7c92440fe5))
+
+- Reject non-finite and negative size filters
+  ([`6cda1bf`](https://github.com/lperezmo/pyofiles/commit/6cda1bfc185e81bc073dbee3afedd45ae65a11d0))
+
+min_size_mb/max_size_mb values of NaN silently disabled the size bound (NaN comparisons are always
+  false) and negatives clamped to zero in the f64-to-u64 cast. mb_to_bytes now raises ValueError for
+  anything that is not finite and non-negative, covering the Python API on every function, and the
+  CLI's --min-size/--max-size use a finite_float argparse type for a clean exit-2 error.
+
 - **ci**: Define least-privilege release permissions
   ([`868284b`](https://github.com/lperezmo/pyofiles/commit/868284b38665952a327a294ccb7383770d176c86))
 
 - **ci**: Define least-privilege workflow permissions
   ([`13e3902`](https://github.com/lperezmo/pyofiles/commit/13e390266e87dd3111a4cbf03911207cfccb1142))
+
+### Chores
+
+- Change from quite to verbose tests on ci.yml
+  ([`f266d2e`](https://github.com/lperezmo/pyofiles/commit/f266d2e571fe7ceb1c3aa8bded2d7262586dfc3c))
+
+### Testing
+
+- Convert suite to real pytest and harden CLI argument parsing
+  ([`72a3dda`](https://github.com/lperezmo/pyofiles/commit/72a3dda0fe1a7c637bbd5bc2c856cbfdefc1dbbb))
+
+The Python test suite used a print-only check harness, so under pytest every test passed trivially;
+  only the script-mode run in CI could catch failures. Rewrite it as genuine pytest tests with
+  asserts and per-test tmp_path fixtures (75 tests), covering CLI parsing, time formats, output
+  escaping, and boundary values. CI installs pytest and runs 'python -m pytest tests/ -q'.
+
+CLI hardening: - parse_time accepts case-insensitive duration units ('7D', '24H') and timezone-aware
+  ISO datetimes (+02:00 or trailing Z) on all supported Pythons; date-only + Z means UTC midnight;
+  lenient forms like 2024-3-5 keep working. Bare digit strings always mean unix seconds regardless
+  of Python version (fromisoformat grew lenient in 3.11+ and would otherwise reinterpret 20240101 as
+  a date). nan/inf are rejected instead of silently disabling time filters. - New argparse
+  validators: --max-depth/--limit >= 0, du --depth/--top keep accepting 0 (totals-only output),
+  --threads must be >= 1, underscore forms like 1_000 rejected.
+
+Rust: SectorReader::read short-circuits zero-length requests instead of issuing a padded sector read
+  that could spuriously fail with UnexpectedEof near the end of a volume.
 
 
 ## v0.7.1 (2026-07-12)
