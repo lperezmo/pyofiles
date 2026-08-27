@@ -23,11 +23,17 @@ jobs:
       - uses: actions/setup-python@v6
         with: { python-version: '3.13' }
 
+      - name: Install Semantic Release
+        run: >-
+          python -m pip install
+          "python-semantic-release==9.21.2"
+          "GitPython==3.1.59"
+
       - name: Semantic Release
         id: release
-        uses: python-semantic-release/python-semantic-release@v9
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: semantic-release -v version
 
   linux:
     needs: [release]
