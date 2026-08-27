@@ -33,7 +33,7 @@ jobs:
           python -c "import pyofiles; print('walk:', len(pyofiles.walk('.'))); print('find:', len(pyofiles.find('.', extensions=['.rs']))); print('glob:', len(pyofiles.glob('.', '**/*.toml'))); print('list_dir:', len(pyofiles.list_dir('.'))); print('index:', len(pyofiles.index('.', ['.rs', '.toml']))); usage = pyofiles.disk_usage('.'); print(f'disk_usage: {usage.total_files} files, {usage.total_size_mb:.2f} MB'); print('All OK')"
           python -m pytest tests/ -v
         shell: bash
-      - name: CLI smoke test
+      - name: CLI integration tests
         run: |
           pyofiles --version
           python -m pyofiles --version
@@ -48,7 +48,7 @@ jobs:
       # GitHub windows runners are elevated, so the real MFT path can be
       # exercised against the NTFS system volume. The workspace itself may
       # live on a ReFS Dev Drive, hence the fixed C:\ target directory.
-      - name: MFT fast path smoke test (Windows, elevated)
+      - name: MFT fast path integration test (Windows, elevated)
         if: runner.os == 'Windows'
         run: |
           python - <<'EOF'
