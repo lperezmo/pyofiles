@@ -170,8 +170,36 @@ fn check_size_filters(size: u64, min_bytes: Option<u64>, max_bytes: Option<u64>)
     true
 }
 
-fn mb_to_bytes(mb: Option<f64>) -> Option<u64> {
-    mb.map(|v| (v * 1024.0 * 1024.0) as u64)
+/// Megabytes to bytes. NaN would silently disable the filter (NaN
+/// comparisons are always false), a negative cast would clamp to 0, and
+/// an overflowing positive cast would clamp to u64::MAX. Reject all three.
+fn mb_to_bytes(mb: Option<f64>) -> PyResult<Option<u64>> {
+    match mb {
+        None => Ok(None),
+        Some(v) if v.is_finite() && v >= 0.0 => {
+            let bytes = v * 1024.0 * 1024.0;
+            if bytes < u64::MAX as f64 {
+                Ok(Some(bytes as u64))
+            } else {
+                Err(PyValueError::new_err(format!(
+                    "size filter must be representable in bytes, got {v} megabytes"
+                )))
+            }
+        }
+        Some(v) => Err(PyValueError::new_err(format!(
+            "size filter must be a finite, non-negative number of megabytes, got {v}"
+        ))),
+    }
+}
+
+fn finite_time_filter(value: Option<f64>) -> PyResult<Option<f64>> {
+    match value {
+        None => Ok(None),
+        Some(v) if v.is_finite() => Ok(Some(v)),
+        Some(v) => Err(PyValueError::new_err(format!(
+            "time filter must be finite, got {v}"
+        ))),
+    }
 }
 
 fn validate_dir(directory: &str) -> PyResult<()> {
@@ -260,17 +288,17 @@ impl Filters {
         modified_before: Option<f64>,
         created_after: Option<f64>,
         created_before: Option<f64>,
-    ) -> Self {
-        Filters {
+    ) -> PyResult<Self> {
+        Ok(Filters {
             exts: extensions.map(|e| normalize_exts(&e)),
             names: names.map(|n| n.iter().map(|s| s.to_lowercase()).collect()),
-            min_bytes: mb_to_bytes(min_size_mb),
-            max_bytes: mb_to_bytes(max_size_mb),
-            modified_after,
-            modified_before,
-            created_after,
-            created_before,
-        }
+            min_bytes: mb_to_bytes(min_size_mb)?,
+            max_bytes: mb_to_bytes(max_size_mb)?,
+            modified_after: finite_time_filter(modified_after)?,
+            modified_before: finite_time_filter(modified_before)?,
+            created_after: finite_time_filter(created_after)?,
+            created_before: finite_time_filter(created_before)?,
+        })
     }
 
     fn has_name_filters(&self) -> bool {
@@ -543,7 +571,7 @@ fn walk(
     threads: Option<usize>,
     mft: bool,
 ) -> PyResult<Vec<FileEntry>> {
-    let filters = Filters::new(extensions, names, min_size_mb, max_size_mb, modified_after, modified_before, created_after, created_before);
+    let filters = Filters::new(extensions, names, min_size_mb, max_size_mb, modified_after, modified_before, created_after, created_before)?;
 
     if mft {
         #[cfg(windows)]
@@ -638,7 +666,7 @@ fn list_dir(
     created_before: Option<f64>,
 ) -> PyResult<Vec<FileEntry>> {
     validate_dir(&directory)?;
-    let filters = Filters::new(extensions, names, min_size_mb, max_size_mb, modified_after, modified_before, created_after, created_before);
+    let filters = Filters::new(extensions, names, min_size_mb, max_size_mb, modified_after, modified_before, created_after, created_before)?;
 
     py.detach(|| {
         let mut entries = Vec::new();
@@ -730,7 +758,7 @@ fn find(
     threads: Option<usize>,
     mft: bool,
 ) -> PyResult<Vec<FileEntry>> {
-    let filters = Filters::new(extensions, names, min_size_mb, max_size_mb, modified_after, modified_before, created_after, created_before);
+    let filters = Filters::new(extensions, names, min_size_mb, max_size_mb, modified_after, modified_before, created_after, created_before)?;
 
     if mft {
         #[cfg(windows)]
@@ -866,7 +894,7 @@ fn index(
 ) -> PyResult<HashMap<String, HashMap<String, String>>> {
     validate_dir(&directory)?;
     let exts = normalize_exts(&extensions);
-    let filters = Filters::new(None, names, min_size_mb, max_size_mb, modified_after, modified_before, created_after, created_before);
+    let filters = Filters::new(None, names, min_size_mb, max_size_mb, modified_after, modified_before, created_after, created_before)?;
 
     py.detach(|| {
         let (tx, rx) = mpsc::channel::<(String, String, String)>();
@@ -993,7 +1021,7 @@ fn glob(
     threads: Option<usize>,
 ) -> PyResult<Vec<String>> {
     validate_dir(&directory)?;
-    let filters = Filters::new(None, None, min_size_mb, max_size_mb, modified_after, modified_before, created_after, created_before);
+    let filters = Filters::new(None, None, min_size_mb, max_size_mb, modified_after, modified_before, created_after, created_before)?;
 
     py.detach(|| {
         let matcher = GlobPattern::new(&pattern)
@@ -1108,7 +1136,7 @@ fn disk_usage(
     threads: Option<usize>,
     mft: bool,
 ) -> PyResult<DiskUsage> {
-    let filters = Filters::new(extensions, names, min_size_mb, max_size_mb, modified_after, modified_before, created_after, created_before);
+    let filters = Filters::new(extensions, names, min_size_mb, max_size_mb, modified_after, modified_before, created_after, created_before)?;
 
     if mft {
         #[cfg(windows)]
@@ -1220,6 +1248,25 @@ mod tests {
         assert_eq!(literal_prefix_components("src/**/*.rs"), vec!["src"]);
         assert!(literal_prefix_components("../outside/*.rs").is_empty());
         assert!(literal_prefix_components("/outside/*.rs").is_empty());
+    }
+
+    #[test]
+    fn size_filters_reject_non_finite_and_negative() {
+        assert_eq!(mb_to_bytes(None).unwrap(), None);
+        assert_eq!(mb_to_bytes(Some(1.5)).unwrap(), Some(1_572_864));
+        assert!(mb_to_bytes(Some(f64::NAN)).is_err());
+        assert!(mb_to_bytes(Some(f64::INFINITY)).is_err());
+        assert!(mb_to_bytes(Some(-0.001)).is_err());
+        assert!(mb_to_bytes(Some(1e308)).is_err());
+    }
+
+    #[test]
+    fn time_filters_reject_non_finite_values() {
+        assert_eq!(finite_time_filter(None).unwrap(), None);
+        assert_eq!(finite_time_filter(Some(1.5)).unwrap(), Some(1.5));
+        assert!(finite_time_filter(Some(f64::NAN)).is_err());
+        assert!(finite_time_filter(Some(f64::INFINITY)).is_err());
+        assert!(finite_time_filter(Some(f64::NEG_INFINITY)).is_err());
     }
 
     #[cfg(windows)]

@@ -1,535 +1,521 @@
-"""
-Comprehensive test script for pyofiles library.
-Tests all functions: walk, find, list_dir, index, glob, disk_usage.
+"""Pytest suite for pyofiles: bindings, filters, CLI parsing, and the MFT fast path.
+
+Every test uses real asserts, so failures fail under pytest as well as
+`python tests/test_pyofiles.py` (which delegates to pytest).
 """
 
-import os
+from __future__ import annotations
+
+import argparse
+import contextlib
+import ctypes
+import io
 import sys
 import time
-import shutil
-import contextlib
-import io
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 import pyofiles
-from pyofiles.cli import escape_terminal_controls, print_entries
+from pyofiles.cli import (
+    build_parser,
+    escape_terminal_controls,
+    format_size,
+    parse_time,
+    print_entries,
+)
 
 # ---------------------------------------------------------------------------
-# Setup: build a fixture directory tree with known structure
+# Fixture tree
 # ---------------------------------------------------------------------------
 
-FIXTURES = Path(__file__).parent / "test_fixtures"
 
-
-def setup_fixtures():
-    """Create a reproducible directory tree for testing."""
-    if FIXTURES.exists():
-        shutil.rmtree(FIXTURES)
-
-    # directories
-    (FIXTURES / "src" / "helpers").mkdir(parents=True)
-    (FIXTURES / "data").mkdir()
-    (FIXTURES / "docs" / "images").mkdir(parents=True)
+@pytest.fixture
+def tree(tmp_path: Path) -> Path:
+    """A fresh directory tree with a known structure for every test."""
+    root = tmp_path / "fixtures"
+    (root / "src" / "helpers").mkdir(parents=True)
+    (root / "data").mkdir()
+    (root / "docs" / "images").mkdir(parents=True)
 
     # root-level files
-    (FIXTURES / ".hidden_file.txt").write_text("hidden")
-    (FIXTURES / "readme.txt").write_text("hello world")
-    (FIXTURES / "report_2024.pdf").write_bytes(b"%PDF-fake-report")
-    (FIXTURES / "invoice_march.pdf").write_bytes(b"%PDF-fake-invoice")
+    (root / ".hidden_file.txt").write_text("hidden")
+    (root / "readme.txt").write_text("hello world")
+    (root / "report_2024.pdf").write_bytes(b"%PDF-fake-report")
+    (root / "invoice_march.pdf").write_bytes(b"%PDF-fake-invoice")
 
     # src/
-    (FIXTURES / "src" / "main.py").write_text("print('main')\n")
-    (FIXTURES / "src" / "main.pyc").write_bytes(b"\x00compiled")
-    (FIXTURES / "src" / "utils.py").write_text("# utils\n")
-    (FIXTURES / "src" / "helpers" / "io.py").write_text("# io helpers\n")
-    (FIXTURES / "src" / "helpers" / "io.pyi").write_text("# io stubs\n")
+    (root / "src" / "main.py").write_text("print('main')\n")
+    (root / "src" / "main.pyc").write_bytes(b"\x00compiled")
+    (root / "src" / "utils.py").write_text("# utils\n")
+    (root / "src" / "helpers" / "io.py").write_text("# io helpers\n")
+    (root / "src" / "helpers" / "io.pyi").write_text("# io stubs\n")
 
     # data/
-    (FIXTURES / "data" / "output.csv").write_text("a,b,c\n1,2,3\n")
-    (FIXTURES / "data" / "output.json").write_text('{"key": "value"}\n')
+    (root / "data" / "output.csv").write_text("a,b,c\n1,2,3\n")
+    (root / "data" / "output.json").write_text('{"key": "value"}\n')
     # ~1.5 MB file for size-filter tests
-    (FIXTURES / "data" / "large_file.bin").write_bytes(b"\x00" * (1_500_000))
+    (root / "data" / "large_file.bin").write_bytes(b"\x00" * 1_500_000)
 
-    # docs/
-    (FIXTURES / "docs" / "guide.md").write_text("# Guide\n")
-    (FIXTURES / "docs" / "images" / "logo.png").write_bytes(b"\x89PNG-fake")
+    return root
 
 
-def teardown_fixtures():
-    if FIXTURES.exists():
-        shutil.rmtree(FIXTURES)
+def file_names(entries) -> set[str]:
+    return {e.name for e in entries if e.is_file}
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# walk
 # ---------------------------------------------------------------------------
 
-passed = 0
-failed = 0
 
-
-def check(label: str, condition: bool, detail: str = ""):
-    global passed, failed
-    if condition:
-        passed += 1
-        print(f"  PASS  {label}")
-    else:
-        failed += 1
-        msg = f"  FAIL  {label}"
-        if detail:
-            msg += f"  -- {detail}"
-        print(msg)
-
-
-def section(title: str):
-    print(f"\n{'='*60}\n  {title}\n{'='*60}")
-
-
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
-
-def test_walk():
-    section("walk")
-    root = str(FIXTURES)
-
-    # basic walk — should find all files and dirs
-    entries = pyofiles.walk(root)
+def test_walk_basic(tree: Path):
+    entries = pyofiles.walk(str(tree))
     names = {e.name for e in entries}
-    check("returns entries", len(entries) > 0)
-    check("includes nested file", "io.py" in names, f"names={names}")
-    check("includes directory", "helpers" in names or any(e.is_dir for e in entries))
-
-    # extension filter
-    py_entries = pyofiles.walk(root, extensions=[".py"])
-    py_names = {e.name for e in py_entries if e.is_file}
-    check("extension filter .py", py_names == {"main.py", "utils.py", "io.py"},
-          f"got {py_names}")
-
-    # skip_hidden
-    visible = pyofiles.walk(root, skip_hidden=True)
-    visible_names = {e.name for e in visible}
-    check("skip_hidden excludes dotfiles", ".hidden_file.txt" not in visible_names,
-          f"visible_names={visible_names}")
-
-    # max_depth
-    shallow = pyofiles.walk(root, max_depth=1)
-    shallow_names = {e.name for e in shallow if e.is_file}
-    check("max_depth=1 excludes deep files", "io.py" not in shallow_names,
-          f"shallow_names={shallow_names}")
-
-    # FileEntry attributes
-    file_entries = [e for e in entries if e.is_file and e.name == "readme.txt"]
-    if file_entries:
-        fe = file_entries[0]
-        check("FileEntry.path is str", isinstance(fe.path, str))
-        check("FileEntry.name", fe.name == "readme.txt")
-        check("FileEntry.is_file", fe.is_file is True)
-        check("FileEntry.is_dir", fe.is_dir is False)
-        check("FileEntry.size > 0", fe.size > 0, f"size={fe.size}")
-        check("FileEntry.extension (no dot)", fe.extension == "txt", f"ext={fe.extension}")
-    else:
-        check("FileEntry lookup", False, "readme.txt not found")
+    assert entries
+    assert "io.py" in names
+    assert any(e.is_dir for e in entries)
 
 
-def test_find():
-    section("find")
-    root = str(FIXTURES)
+def test_walk_extension_filter(tree: Path):
+    py_entries = pyofiles.walk(str(tree), extensions=[".py"])
+    assert file_names(py_entries) == {"main.py", "utils.py", "io.py"}
+    # extensions normalize: no leading dot must work too
+    assert file_names(pyofiles.walk(str(tree), extensions=["PY"])) == {
+        "main.py", "utils.py", "io.py",
+    }
 
-    # find by name substring
-    results = pyofiles.find(root, names=["report"])
-    found = {e.name for e in results}
-    check("find by name 'report'", "report_2024.pdf" in found, f"found={found}")
 
-    # multiple name substrings (OR logic)
-    results = pyofiles.find(root, names=["report", "invoice"])
-    found = {e.name for e in results}
-    check("find multiple names", "report_2024.pdf" in found and "invoice_march.pdf" in found,
-          f"found={found}")
+def test_walk_skip_hidden(tree: Path):
+    visible = pyofiles.walk(str(tree), skip_hidden=True)
+    assert ".hidden_file.txt" not in {e.name for e in visible}
 
-    # find by extension
-    results = pyofiles.find(root, extensions=[".csv", ".json"])
-    found = {e.name for e in results}
-    check("find by extensions", found == {"output.csv", "output.json"}, f"found={found}")
 
-    # find by min_size_mb (need at least names or extensions too)
-    results = pyofiles.find(root, extensions=[".bin"], min_size_mb=1)
-    found = {e.name for e in results}
-    check("find min_size_mb=1", "large_file.bin" in found, f"found={found}")
+def test_walk_max_depth(tree: Path):
+    shallow = pyofiles.walk(str(tree), max_depth=1)
+    assert "io.py" not in {e.name for e in shallow}
 
-    # find by max_size_mb
-    results = pyofiles.find(root, extensions=[".bin", ".txt", ".py"], max_size_mb=1)
-    found = {e.name for e in results}
-    check("find max_size_mb=1 excludes large", "large_file.bin" not in found, f"found={found}")
 
-    # combined filters
-    results = pyofiles.find(root, names=["output"], extensions=[".json"])
-    found = {e.name for e in results}
-    check("find combined name+ext", found == {"output.json"}, f"found={found}")
+def test_file_entry_attributes(tree: Path):
+    fe = next(e for e in pyofiles.walk(str(tree)) if e.is_file and e.name == "readme.txt")
+    assert isinstance(fe.path, str)
+    assert fe.is_file is True
+    assert fe.is_dir is False
+    assert fe.size > 0
+    assert fe.extension == "txt"
 
-    # limit stops early
-    results = pyofiles.find(root, extensions=[".py"], limit=2)
-    check("find limit=2 returns 2", len(results) == 2, f"count={len(results)}")
 
-    results = pyofiles.find(root, extensions=[".py"], limit=100)
-    check("find limit above match count returns all", len(results) == 3,
-          f"count={len(results)}")
-
-    results = pyofiles.find(root, extensions=[".py"], limit=0)
-    check("find limit=0 returns empty", len(results) == 0, f"count={len(results)}")
-
+def test_walk_name_and_size_filters(tree: Path):
+    assert {"main.py", "main.pyc"} <= file_names(pyofiles.walk(str(tree), names=["main"]))
+    assert file_names(pyofiles.walk(str(tree), min_size_mb=1)) == {"large_file.bin"}
+    assert "large_file.bin" not in file_names(pyofiles.walk(str(tree), max_size_mb=1))
+    # with any filter active, only files are returned; without filters, dirs too
+    assert all(e.is_file for e in pyofiles.walk(str(tree), extensions=[".py"]))
+    assert any(e.is_dir for e in pyofiles.walk(str(tree)))
     # threads parameter accepted
-    results = pyofiles.find(root, extensions=[".py"], threads=2)
-    check("find threads=2 works", len(results) == 3, f"count={len(results)}")
+    assert len(pyofiles.walk(str(tree), extensions=[".py"], threads=2)) == 3
 
 
-def test_list_dir():
-    section("list_dir")
-    root = str(FIXTURES)
+# ---------------------------------------------------------------------------
+# find
+# ---------------------------------------------------------------------------
 
-    entries = pyofiles.list_dir(root)
+
+def test_find_by_name(tree: Path):
+    assert "report_2024.pdf" in file_names(pyofiles.find(str(tree), names=["report"]))
+    both = pyofiles.find(str(tree), names=["report", "invoice"])
+    assert {"report_2024.pdf", "invoice_march.pdf"} <= file_names(both)
+
+
+def test_find_by_extension(tree: Path):
+    found = pyofiles.find(str(tree), extensions=[".csv", ".json"])
+    assert file_names(found) == {"output.csv", "output.json"}
+
+
+def test_find_size_filters(tree: Path):
+    assert "large_file.bin" in file_names(
+        pyofiles.find(str(tree), extensions=[".bin"], min_size_mb=1))
+    assert "large_file.bin" not in file_names(
+        pyofiles.find(str(tree), extensions=[".bin", ".txt", ".py"], max_size_mb=1))
+    # size filter alone is allowed
+    assert "large_file.bin" in file_names(pyofiles.find(str(tree), min_size_mb=1))
+
+
+def test_find_combined_filters(tree: Path):
+    found = pyofiles.find(str(tree), names=["output"], extensions=[".json"])
+    assert file_names(found) == {"output.json"}
+
+
+def test_find_limit(tree: Path):
+    assert len(pyofiles.find(str(tree), extensions=[".py"], limit=2)) == 2
+    assert len(pyofiles.find(str(tree), extensions=[".py"], limit=100)) == 3
+    assert len(pyofiles.find(str(tree), extensions=[".py"], limit=0)) == 0
+    assert len(pyofiles.find(str(tree), extensions=[".py"], threads=2)) == 3
+
+
+def test_find_requires_a_filter(tree: Path):
+    with pytest.raises(ValueError, match="at least"):
+        pyofiles.find(str(tree))
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf"), -1.0])
+def test_size_filters_reject_non_finite_and_negative(bad, tree: Path):
+    for call in (
+        lambda: pyofiles.walk(str(tree), min_size_mb=bad),
+        lambda: pyofiles.find(str(tree), max_size_mb=bad),
+        lambda: pyofiles.list_dir(str(tree), min_size_mb=bad),
+        lambda: pyofiles.glob(str(tree), "**/*", min_size_mb=bad),
+        lambda: pyofiles.index(str(tree), extensions=[".py"], max_size_mb=bad),
+        lambda: pyofiles.disk_usage(str(tree), min_size_mb=bad),
+    ):
+        with pytest.raises(ValueError, match="finite, non-negative"):
+            call()
+
+
+def test_size_filters_reject_unrepresentable_values(tree: Path):
+    with pytest.raises(ValueError, match="representable"):
+        pyofiles.walk(str(tree), min_size_mb=1e308)
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_time_filters_reject_non_finite_values(bad, tree: Path):
+    for call in (
+        lambda: pyofiles.walk(str(tree), modified_after=bad),
+        lambda: pyofiles.find(str(tree), names=["readme"], modified_before=bad),
+        lambda: pyofiles.list_dir(str(tree), created_after=bad),
+        lambda: pyofiles.glob(str(tree), "**/*", created_before=bad),
+        lambda: pyofiles.index(str(tree), extensions=[".py"], modified_after=bad),
+        lambda: pyofiles.disk_usage(str(tree), modified_before=bad),
+    ):
+        with pytest.raises(ValueError, match="time filter must be finite"):
+            call()
+
+
+# ---------------------------------------------------------------------------
+# list_dir
+# ---------------------------------------------------------------------------
+
+
+def test_list_dir_basic(tree: Path):
+    entries = pyofiles.list_dir(str(tree))
     names = {e.name for e in entries}
-    check("list_dir returns entries", len(entries) > 0)
-    check("list_dir has root files", "readme.txt" in names, f"names={names}")
-    check("list_dir has subdirs", "src" in names)
-    check("list_dir is non-recursive", "io.py" not in names,
-          "should not contain deeply nested files")
-
-    # check a subdirectory
-    src_entries = pyofiles.list_dir(str(FIXTURES / "src"))
-    src_names = {e.name for e in src_entries}
-    check("list_dir src/", "main.py" in src_names, f"src_names={src_names}")
-
-
-def test_index():
-    section("index")
-
-    # Index src/ for Python-related extensions
-    idx = pyofiles.index(str(FIXTURES / "src"), extensions=[".py", ".pyi", ".pyc"])
-    check("index returns dict", isinstance(idx, dict))
-    check("index has 'main' stem", "main" in idx, f"keys={list(idx.keys())}")
-    check("index has 'io' stem", "io" in idx, f"keys={list(idx.keys())}")
-
-    if "main" in idx:
-        main_exts = set(idx["main"].keys())
-        check("main has .py", ".py" in main_exts, f"exts={main_exts}")
-        check("main has .pyc", ".pyc" in main_exts, f"exts={main_exts}")
-
-    if "io" in idx:
-        io_exts = set(idx["io"].keys())
-        check("io has .py and .pyi", {".py", ".pyi"} <= io_exts, f"exts={io_exts}")
-
-
-def test_glob():
-    section("glob")
-    root = str(FIXTURES)
-
-    # all .py files recursively
-    paths = pyofiles.glob(root, "**/*.py")
-    basenames = {os.path.basename(p) for p in paths}
-    check("glob **/*.py", {"main.py", "utils.py", "io.py"} <= basenames,
-          f"basenames={basenames}")
-
-    # single-level glob
-    paths = pyofiles.glob(root, "*.txt")
-    basenames = {os.path.basename(p) for p in paths}
-    check("glob *.txt", "readme.txt" in basenames, f"basenames={basenames}")
-
-    # pdf glob
-    paths = pyofiles.glob(root, "**/*.pdf")
-    basenames = {os.path.basename(p) for p in paths}
-    check("glob **/*.pdf", {"report_2024.pdf", "invoice_march.pdf"} <= basenames,
-          f"basenames={basenames}")
-
-    # skip_hidden
-    paths_visible = pyofiles.glob(root, "**/*.txt", skip_hidden=True)
-    basenames_vis = {os.path.basename(p) for p in paths_visible}
-    check("glob skip_hidden", ".hidden_file.txt" not in basenames_vis)
-
-
-def test_disk_usage():
-    section("disk_usage")
-    root = str(FIXTURES)
-
-    usage = pyofiles.disk_usage(root, depth=2, top=10)
-
-    check("DiskUsage.total_size > 0", usage.total_size > 0, f"total={usage.total_size}")
-    check("DiskUsage.total_files > 0", usage.total_files > 0, f"files={usage.total_files}")
-    check("DiskUsage.total_size_mb > 1", usage.total_size_mb > 1,
-          f"size_mb={usage.total_size_mb}")
-    check("DiskUsage.total_size_gb is float", isinstance(usage.total_size_gb, float))
-
-    check("entries is list", isinstance(usage.entries, list))
-    if usage.entries:
-        e = usage.entries[0]
-        check("SizeEntry.path", isinstance(e.path, str))
-        check("SizeEntry.size", isinstance(e.size, int) and e.size >= 0)
-        check("SizeEntry.file_count", isinstance(e.file_count, int))
-        check("SizeEntry.size_mb", isinstance(e.size_mb, float))
-        check("SizeEntry.size_gb", isinstance(e.size_gb, float))
-
-    # depth=1 should give fewer entries than depth=2
-    usage1 = pyofiles.disk_usage(root, depth=1)
-    usage2 = pyofiles.disk_usage(root, depth=2)
-    check("depth=2 >= depth=1 entries",
-          len(usage2.entries) >= len(usage1.entries),
-          f"d1={len(usage1.entries)} d2={len(usage2.entries)}")
-
-
-def test_time_filters():
-    section("time filters")
-    root = str(FIXTURES)
-
-    # All fixture files were just created, so modified time is recent
-    now = time.time()
-    one_minute_ago = now - 60
-
-    # FileEntry should have timestamps
-    entries = pyofiles.walk(root)
-    file_entries = [e for e in entries if e.is_file]
-    if file_entries:
-        fe = file_entries[0]
-        check("FileEntry.modified is float", isinstance(fe.modified, float),
-              f"type={type(fe.modified)}")
-        check("FileEntry.modified is recent", fe.modified > one_minute_ago,
-              f"modified={fe.modified}, threshold={one_minute_ago}")
-        check("FileEntry.created is float or None",
-              fe.created is None or isinstance(fe.created, float))
-    else:
-        check("fixture files exist", False, "no file entries found")
-
-    # walk with modified_after should return recently created fixtures
-    recent = pyofiles.walk(root, modified_after=one_minute_ago)
-    recent_files = [e for e in recent if e.is_file]
-    check("walk modified_after finds recent files", len(recent_files) > 0,
-          f"count={len(recent_files)}")
-
-    # walk with modified_before=one_minute_ago should return nothing (all files are newer)
-    old = pyofiles.walk(root, modified_before=one_minute_ago)
-    old_files = [e for e in old if e.is_file]
-    check("walk modified_before excludes recent", len(old_files) == 0,
-          f"count={len(old_files)}")
-
-    # find with modified_after
-    found = pyofiles.find(root, extensions=[".py"], modified_after=one_minute_ago)
-    found_names = {e.name for e in found}
-    check("find modified_after + ext", "main.py" in found_names,
-          f"found={found_names}")
-
-    # find with only time filter (no names or extensions)
-    found_time_only = pyofiles.find(root, modified_after=one_minute_ago)
-    check("find with time filter only", len(found_time_only) > 0,
-          f"count={len(found_time_only)}")
-
-    # find with modified_before should exclude all recent files
-    found_old = pyofiles.find(root, extensions=[".py"], modified_before=one_minute_ago)
-    check("find modified_before excludes recent", len(found_old) == 0,
-          f"count={len(found_old)}")
-
-
-def test_walk_name_and_size_filters():
-    section("walk — name and size filters")
-    root = str(FIXTURES)
-
-    # walk with names filter
-    entries = pyofiles.walk(root, names=["main"])
-    file_names = {e.name for e in entries if e.is_file}
-    check("walk names=['main'] finds main files",
-          "main.py" in file_names and "main.pyc" in file_names,
-          f"got {file_names}")
-
-    # walk with min_size_mb — only large_file.bin is >1MB
-    entries = pyofiles.walk(root, min_size_mb=1)
-    file_names = {e.name for e in entries if e.is_file}
-    check("walk min_size_mb=1 finds large file",
-          file_names == {"large_file.bin"},
-          f"got {file_names}")
-
-    # walk with max_size_mb — should exclude large_file.bin
-    entries = pyofiles.walk(root, max_size_mb=1)
-    file_names = {e.name for e in entries if e.is_file}
-    check("walk max_size_mb=1 excludes large file",
-          "large_file.bin" not in file_names,
-          f"got {file_names}")
-
-    # when any filter is active, directories are excluded from results
-    entries = pyofiles.walk(root, extensions=[".py"])
-    check("walk with filters returns files only",
-          all(e.is_file for e in entries),
-          f"non-files: {[e.name for e in entries if not e.is_file]}")
-
-    # without filters, directories are included
-    entries = pyofiles.walk(root)
-    check("walk without filters includes dirs",
-          any(e.is_dir for e in entries))
-
-    # threads parameter accepted
-    entries = pyofiles.walk(root, extensions=[".py"], threads=2)
-    check("walk threads=2 works", len(entries) == 3, f"count={len(entries)}")
-
-
-def test_list_dir_filters():
-    section("list_dir — filters")
-    root = str(FIXTURES)
-
-    # extension filter
-    entries = pyofiles.list_dir(root, extensions=[".txt"])
-    file_names = {e.name for e in entries if e.is_file}
-    check("list_dir ext=.txt", "readme.txt" in file_names, f"got {file_names}")
-    check("list_dir ext=.txt excludes pdf", "report_2024.pdf" not in file_names)
-
-    # skip_hidden
-    entries = pyofiles.list_dir(root, skip_hidden=True)
-    names = {e.name for e in entries}
-    check("list_dir skip_hidden", ".hidden_file.txt" not in names)
-
-    entries_all = pyofiles.list_dir(root, skip_hidden=False)
-    names_all = {e.name for e in entries_all}
-    check("list_dir shows hidden by default", ".hidden_file.txt" in names_all)
-
-    # names filter
-    entries = pyofiles.list_dir(root, names=["report"])
-    file_names = {e.name for e in entries if e.is_file}
-    check("list_dir names=['report']", "report_2024.pdf" in file_names, f"got {file_names}")
-
-    # time filter
-    now = time.time()
-    entries = pyofiles.list_dir(root, modified_after=now - 60)
-    file_names = {e.name for e in entries if e.is_file}
-    check("list_dir modified_after finds recent", len(file_names) > 0, f"got {file_names}")
-
-
-def test_glob_filters():
-    section("glob — filters")
-    root = str(FIXTURES)
-
-    # max_depth
-    paths = pyofiles.glob(root, "**/*.py", max_depth=2)
-    basenames = {os.path.basename(p) for p in paths}
-    check("glob max_depth=2 excludes deep files", "io.py" not in basenames,
-          f"basenames={basenames}")
-
-    # time filter
-    now = time.time()
-    paths = pyofiles.glob(root, "**/*.py", modified_after=now - 60)
-    basenames = {os.path.basename(p) for p in paths}
-    check("glob modified_after finds recent .py", "main.py" in basenames,
-          f"basenames={basenames}")
-
-    paths_old = pyofiles.glob(root, "**/*.py", modified_before=now - 60)
-    check("glob modified_before excludes recent", len(paths_old) == 0,
-          f"count={len(paths_old)}")
-
-    # size filter
-    paths = pyofiles.glob(root, "**/*", min_size_mb=1)
-    basenames = {os.path.basename(p) for p in paths}
-    check("glob min_size_mb=1 finds large file", "large_file.bin" in basenames,
-          f"basenames={basenames}")
-
-
-def test_index_filters():
-    section("index — filters")
-
-    # max_depth — index src/ with max_depth=1, should not find helpers/io
-    idx = pyofiles.index(str(FIXTURES / "src"), extensions=[".py", ".pyi"], max_depth=1)
-    check("index max_depth=1 excludes deep", "io" not in idx, f"keys={list(idx.keys())}")
-    check("index max_depth=1 includes shallow", "main" in idx, f"keys={list(idx.keys())}")
-
-    # time filter
-    now = time.time()
-    idx = pyofiles.index(str(FIXTURES / "src"), extensions=[".py"], modified_after=now - 60)
-    check("index modified_after finds recent", "main" in idx, f"keys={list(idx.keys())}")
-
-    idx_old = pyofiles.index(str(FIXTURES / "src"), extensions=[".py"], modified_before=now - 60)
-    check("index modified_before excludes recent", len(idx_old) == 0,
-          f"keys={list(idx_old.keys())}")
-
-    # names filter
-    idx = pyofiles.index(str(FIXTURES / "src"), extensions=[".py", ".pyi", ".pyc"], names=["io"])
-    check("index names=['io']", "io" in idx and "main" not in idx,
-          f"keys={list(idx.keys())}")
-
-
-def test_disk_usage_filters():
-    section("disk_usage — filters")
-    root = str(FIXTURES)
-
-    # extensions filter — only .py files
-    usage = pyofiles.disk_usage(root, extensions=[".py"])
-    py_names = set()
-    for e in usage.entries:
-        py_names.add(os.path.basename(e.path))
-    check("du extensions=.py counts only py", usage.total_files > 0,
-          f"total_files={usage.total_files}")
-    # total size should be much less than the 1.5MB large_file.bin
-    check("du extensions=.py small total", usage.total_size < 500_000,
-          f"total_size={usage.total_size}")
-
-    # names filter
-    usage = pyofiles.disk_usage(root, names=["large"])
-    check("du names=['large'] finds large file", usage.total_files == 1,
-          f"total_files={usage.total_files}")
-    check("du names=['large'] correct size", usage.total_size >= 1_400_000,
-          f"total_size={usage.total_size}")
-
-    # time filter
-    now = time.time()
-    usage = pyofiles.disk_usage(root, modified_after=now - 60)
-    check("du modified_after finds recent", usage.total_files > 0,
-          f"total_files={usage.total_files}")
-
-    usage_old = pyofiles.disk_usage(root, modified_before=now - 60)
-    check("du modified_before excludes recent", usage_old.total_files == 0,
-          f"total_files={usage_old.total_files}")
-
-    # min_size_mb filter
-    usage = pyofiles.disk_usage(root, min_size_mb=1)
-    check("du min_size_mb=1 only large", usage.total_files == 1,
-          f"total_files={usage.total_files}")
-
-
-def test_find_size_only():
-    section("find — size filter only")
-    root = str(FIXTURES)
-
-    # find with only size filter (no names or extensions) — should work now
-    results = pyofiles.find(root, min_size_mb=1)
-    found = {e.name for e in results}
-    check("find min_size_mb=1 alone works", "large_file.bin" in found, f"found={found}")
-
-
-def test_index_collisions():
-    section("index — stem collisions are deterministic")
-
-    # Two files with the same stem and extension in different directories:
-    # the lexicographically smallest full path must win, every time.
-    (FIXTURES / "data" / "dup.py").write_text("# data copy\n")
-    (FIXTURES / "src" / "dup.py").write_text("# src copy\n")
-
-    expected = str(FIXTURES / "data" / "dup.py")
+    assert "readme.txt" in names
+    assert "src" in names
+    assert "io.py" not in names  # non-recursive
+
+    src_names = {e.name for e in pyofiles.list_dir(str(tree / "src"))}
+    assert "main.py" in src_names
+
+
+def test_list_dir_sorted(tree: Path):
+    names = [e.name for e in pyofiles.list_dir(str(tree))]
+    assert names == sorted(names)
+
+
+def test_list_dir_filters(tree: Path):
+    txt = pyofiles.list_dir(str(tree), extensions=[".txt"])
+    assert "readme.txt" in file_names(txt)
+    assert "report_2024.pdf" not in file_names(txt)
+
+    visible = {e.name for e in pyofiles.list_dir(str(tree), skip_hidden=True)}
+    assert ".hidden_file.txt" not in visible
+    everything = {e.name for e in pyofiles.list_dir(str(tree))}
+    assert ".hidden_file.txt" in everything
+
+    reports = pyofiles.list_dir(str(tree), names=["report"])
+    assert "report_2024.pdf" in file_names(reports)
+
+
+# ---------------------------------------------------------------------------
+# index
+# ---------------------------------------------------------------------------
+
+
+def test_index_basic(tree: Path):
+    idx = pyofiles.index(str(tree / "src"), extensions=[".py", ".pyi", ".pyc"])
+    assert isinstance(idx, dict)
+    assert {"main", "io"} <= set(idx)
+    assert {".py", ".pyc"} <= set(idx["main"])
+    assert {".py", ".pyi"} <= set(idx["io"])
+
+
+def test_index_filters(tree: Path):
+    idx = pyofiles.index(str(tree / "src"), extensions=[".py", ".pyi"], max_depth=1)
+    assert "main" in idx
+    assert "io" not in idx
+
+    cutoff = time.time() - 60
+    recent = pyofiles.index(str(tree / "src"), extensions=[".py"], modified_after=cutoff)
+    assert "main" in recent
+    old = pyofiles.index(str(tree / "src"), extensions=[".py"], modified_before=cutoff)
+    assert old == {}
+
+    named = pyofiles.index(
+        str(tree / "src"), extensions=[".py", ".pyi", ".pyc"], names=["io"])
+    assert "io" in named and "main" not in named
+
+
+def test_index_collisions_are_deterministic(tree: Path):
+    (tree / "data" / "dup.py").write_text("# data copy\n")
+    (tree / "src" / "dup.py").write_text("# src copy\n")
+
+    expected = str(tree / "data" / "dup.py")
     for run in range(5):
-        idx = pyofiles.index(str(FIXTURES), extensions=[".py"])
-        got = idx.get("dup", {}).get(".py")
-        if got != expected:
-            check(f"index collision keeps smallest path (run {run})", False,
-                  f"got {got}, expected {expected}")
-            return
-    check("index collision keeps smallest path across 5 runs", True)
+        got = pyofiles.index(str(tree), extensions=[".py"])["dup"][".py"]
+        assert got == expected, f"run {run}: got {got}"
 
 
-def test_list_dir_sorted():
-    section("list_dir — sorted output")
-    entries = pyofiles.list_dir(str(FIXTURES))
-    names = [e.name for e in entries]
-    check("list_dir returns sorted names", names == sorted(names), f"names={names}")
+# ---------------------------------------------------------------------------
+# glob
+# ---------------------------------------------------------------------------
 
 
-def test_terminal_output_escaping():
-    section("terminal output escaping")
+def test_glob_patterns(tree: Path):
+    def basenames(paths):
+        return {Path(p).name for p in paths}
+
+    assert {"main.py", "utils.py", "io.py"} <= basenames(
+        pyofiles.glob(str(tree), "**/*.py"))
+    assert "readme.txt" in basenames(pyofiles.glob(str(tree), "*.txt"))
+    assert {"report_2024.pdf", "invoice_march.pdf"} <= basenames(
+        pyofiles.glob(str(tree), "**/*.pdf"))
+
+
+def test_glob_filters(tree: Path):
+    deep = {Path(p).name for p in pyofiles.glob(str(tree), "**/*.py", max_depth=2)}
+    assert "io.py" not in deep
+
+    cutoff = time.time() - 60
+    recent = {Path(p).name for p in pyofiles.glob(str(tree), "**/*.py", modified_after=cutoff)}
+    assert "main.py" in recent
+    assert pyofiles.glob(str(tree), "**/*.py", modified_before=cutoff) == []
+
+    large = {Path(p).name for p in pyofiles.glob(str(tree), "**/*", min_size_mb=1)}
+    assert "large_file.bin" in large
+
+
+# ---------------------------------------------------------------------------
+# disk_usage
+# ---------------------------------------------------------------------------
+
+
+def test_disk_usage_basic(tree: Path):
+    usage = pyofiles.disk_usage(str(tree), depth=2, top=10)
+
+    assert usage.total_size > 0
+    assert usage.total_files > 0
+    assert usage.total_size_mb > 1
+    assert isinstance(usage.total_size_gb, float)
+
+    assert usage.entries
+    first = usage.entries[0]
+    assert isinstance(first.path, str)
+    assert isinstance(first.size, int) and first.size >= 0
+    assert isinstance(first.file_count, int)
+    assert isinstance(first.size_mb, float)
+    assert isinstance(first.size_gb, float)
+
+    # sorted by size, largest first, truncated to top
+    sizes = [e.size for e in usage.entries]
+    assert sizes == sorted(sizes, reverse=True)
+    assert len(sizes) <= 10
+
+
+def test_disk_usage_depth(tree: Path):
+    depth1 = pyofiles.disk_usage(str(tree), depth=1)
+    depth2 = pyofiles.disk_usage(str(tree), depth=2)
+    assert len(depth2.entries) >= len(depth1.entries)
+
+
+def test_disk_usage_filters(tree: Path):
+    py_only = pyofiles.disk_usage(str(tree), extensions=[".py"])
+    assert py_only.total_files > 0
+    assert py_only.total_size < 500_000  # no large_file.bin counted
+
+    large = pyofiles.disk_usage(str(tree), names=["large"])
+    assert large.total_files == 1
+    assert large.total_size >= 1_400_000
+
+    cutoff = time.time() - 60
+    assert pyofiles.disk_usage(str(tree), modified_after=cutoff).total_files > 0
+    assert pyofiles.disk_usage(str(tree), modified_before=cutoff).total_files == 0
+    assert pyofiles.disk_usage(str(tree), min_size_mb=1).total_files == 1
+
+
+# ---------------------------------------------------------------------------
+# time filters
+# ---------------------------------------------------------------------------
+
+
+def test_time_filters(tree: Path):
+    root = str(tree)
+    one_minute_ago = time.time() - 60
+
+    fe = next(e for e in pyofiles.walk(root) if e.is_file)
+    assert isinstance(fe.modified, float)
+    assert fe.modified > one_minute_ago
+    assert fe.created is None or isinstance(fe.created, float)
+
+    recent = [e for e in pyofiles.walk(root, modified_after=one_minute_ago) if e.is_file]
+    assert recent
+    old = [e for e in pyofiles.walk(root, modified_before=one_minute_ago) if e.is_file]
+    assert old == []
+
+    found = {e.name for e in pyofiles.find(root, extensions=[".py"], modified_after=one_minute_ago)}
+    assert "main.py" in found
+    # time filter alone is allowed
+    assert pyofiles.find(root, modified_after=one_minute_ago)
+    found_old = pyofiles.find(root, extensions=[".py"], modified_before=one_minute_ago)
+    assert found_old == []
+
+
+# ---------------------------------------------------------------------------
+# CLI: time parsing
+# ---------------------------------------------------------------------------
+
+
+class TestParseTime:
+    def test_relative_durations(self):
+        for value, seconds in [("7d", 7 * 86400), ("24h", 86400),
+                               ("30m", 1800), ("1w", 604800), ("3600s", 3600)]:
+            assert abs(parse_time(value) - (time.time() - seconds)) < 5, value
+
+    def test_relative_units_are_case_insensitive(self):
+        assert abs(parse_time("24H") - (time.time() - 86400)) < 5
+        assert abs(parse_time("7D") - (time.time() - 7 * 86400)) < 5
+
+    def test_fractional_duration(self):
+        assert abs(parse_time("1.5d") - (time.time() - 129600)) < 5
+
+    def test_iso_date_and_datetime(self):
+        assert parse_time("2024-03-15") == datetime(2024, 3, 15).timestamp()
+        assert parse_time("2024-03-15T10:30") == \
+            datetime(2024, 3, 15, 10, 30).timestamp()
+        assert parse_time("2024-03-15T10:30:00") == \
+            datetime(2024, 3, 15, 10, 30).timestamp()
+
+    def test_iso_with_utc_offset(self):
+        expected = datetime(2024, 3, 15, 8, 30, tzinfo=timezone.utc).timestamp()
+        assert parse_time("2024-03-15T10:30:00+02:00") == expected
+        assert parse_time("2024-03-15T10:30:00-02:00") != expected
+
+    def test_iso_with_z_suffix(self):
+        expected = datetime(2024, 3, 15, 10, 30, tzinfo=timezone.utc).timestamp()
+        assert parse_time("2024-03-15T10:30:00Z") == expected
+        assert parse_time("2024-03-15T10:30:00z") == expected
+        # date-only + Z means UTC midnight, not local midnight
+        assert parse_time("2024-03-15Z") == \
+            datetime(2024, 3, 15, tzinfo=timezone.utc).timestamp()
+
+    def test_non_zero_padded_dates(self):
+        # strptime leniency kept from the original parser
+        assert parse_time("2024-3-5") == datetime(2024, 3, 5).timestamp()
+        assert parse_time("2024-03-15T10:5") == \
+            datetime(2024, 3, 15, 10, 5).timestamp()
+
+    def test_unix_timestamp(self):
+        assert parse_time("1709251200") == 1709251200.0
+
+    def test_digit_strings_always_mean_timestamps(self):
+        # fromisoformat grew more lenient in newer Pythons (basic-format
+        # "20240101" parses as a date on 3.11+ but not 3.9/3.10); digit-only
+        # values must mean unix seconds on every version.
+        assert parse_time("20240101") == 20240101.0
+        assert parse_time("2024") == 2024.0
+
+    @pytest.mark.parametrize("value", ["nan", "inf", "-inf", "infinity"])
+    def test_non_finite_rejected(self, value):
+        with pytest.raises(argparse.ArgumentTypeError):
+            parse_time(value)
+
+    def test_overflowing_duration_rejected(self):
+        with pytest.raises(argparse.ArgumentTypeError, match="finite"):
+            parse_time("9" * 400 + "d")
+
+    @pytest.mark.parametrize("value", ["", "garbage", "2024-13-45", "7x",
+                                       "1_000d", "１２d", "²d"])
+    def test_invalid_values(self, value):
+        with pytest.raises(argparse.ArgumentTypeError):
+            parse_time(value)
+
+
+# ---------------------------------------------------------------------------
+# CLI: numeric argument validation
+# ---------------------------------------------------------------------------
+
+BAD_NUMERIC_ARGS = [
+    ["walk", ".", "--max-depth", "-1"],
+    ["walk", ".", "--max-depth", "abc"],
+    ["walk", ".", "--max-depth", "1_000"],
+    ["walk", ".", "--max-depth", "9" * 400],
+    ["walk", ".", "--threads", "0"],
+    ["walk", ".", "--threads", "-4"],
+    ["find", ".", "--max-depth", "-3"],
+    ["find", ".", "--limit", "-5"],
+    ["find", ".", "--threads", "0"],
+    ["glob", ".", "--max-depth", "-1"],
+    ["glob", ".", "--threads", "-2"],
+    ["index", ".", "--ext", ".py", "--max-depth", "-1"],
+    ["du", ".", "--depth", "-2"],
+    ["du", ".", "--top", "-1"],
+    ["du", ".", "--top", "abc"],
+    ["du", ".", "--threads", "x"],
+    ["find", ".", "--min-size", "nan"],
+    ["find", ".", "--max-size", "inf"],
+    ["find", ".", "--min-size", "-1"],
+    ["find", ".", "--min-size", "1e308"],
+    ["walk", ".", "--min-size", "abc"],
+]
+
+# (argv, attribute, expected parsed value) -- exact equality so a dropped
+# validator or wrong default cannot slip through.
+GOOD_NUMERIC_ARGS = [
+    (["walk", ".", "--max-depth", "0"], "max_depth", 0),
+    (["walk", ".", "--threads", "1"], "threads", 1),
+    (["find", ".", "--limit", "0"], "limit", 0),
+    (["find", ".", "--limit", "10"], "limit", 10),
+    (["glob", ".", "--max-depth", "2"], "max_depth", 2),
+    (["index", ".", "--ext", ".py", "--max-depth", "3"], "max_depth", 3),
+    (["du", ".", "--depth", "0"], "depth", 0),
+    (["du", ".", "--top", "0"], "top", 0),
+    (["du", ".", "--depth", "4"], "depth", 4),
+    (["du", ".", "--top", "5"], "top", 5),
+    (["find", ".", "--min-size", "0"], "min_size", 0.0),
+    (["find", ".", "--max-size", "1.5"], "max_size", 1.5),
+]
+
+
+@pytest.mark.parametrize("argv", BAD_NUMERIC_ARGS)
+def test_cli_rejects_bad_numbers(argv):
+    with pytest.raises(SystemExit) as excinfo:
+        build_parser().parse_args(argv)
+    assert excinfo.value.code == 2
+
+
+@pytest.mark.parametrize(("argv", "attr", "expected"), GOOD_NUMERIC_ARGS)
+def test_cli_accepts_boundary_numbers(argv, attr, expected):
+    args = build_parser().parse_args(argv)  # must not raise SystemExit
+    assert getattr(args, attr) == expected
+
+
+# ---------------------------------------------------------------------------
+# CLI: output formatting helpers
+# ---------------------------------------------------------------------------
+
+
+def test_format_size():
+    assert format_size(512) == "512B"
+    assert format_size(2048) == "2.0KB"
+    assert format_size(5 * 1024 * 1024) == "5.0MB"
+    assert format_size(3 * 1024 * 1024 * 1024) == "3.00GB"
+
+
+def test_terminal_output_escaping(tree: Path):
     malicious_name = "forged\x1b]2;title\x07\rline.txt"
     entries = [SimpleNamespace(
-        path=str(FIXTURES / malicious_name),
+        path=str(tree / malicious_name),
         name=malicious_name,
         is_file=True,
         is_dir=False,
@@ -543,119 +529,60 @@ def test_terminal_output_escaping():
         print_entries(entries)
     output = captured.getvalue()
 
-    check("CLI output contains no raw ESC", "\x1b" not in output, repr(output))
-    check("CLI output contains no raw BEL", "\x07" not in output, repr(output))
-    check("CLI output contains no raw CR", "\r" not in output, repr(output))
-    check("CLI output exposes visible escapes", r"\x1b]2;title\a\rline.txt" in output,
-          repr(output))
-    check("ordinary unicode remains unchanged",
-          escape_terminal_controls("café/資料.txt") == "café/資料.txt")
+    assert "\x1b" not in output
+    assert "\x07" not in output
+    assert "\r" not in output
+    assert r"\x1b]2;title\a\rline.txt" in output
+    # ordinary unicode remains unchanged
+    assert escape_terminal_controls("café/資料.txt") == "café/資料.txt"
+
+
+# ---------------------------------------------------------------------------
+# MFT fast path
+# ---------------------------------------------------------------------------
 
 
 def _is_windows_admin():
     """True when running elevated on Windows (e.g. GitHub windows runners)."""
     if sys.platform != "win32":
         return False
-    import ctypes
     try:
         return ctypes.windll.shell32.IsUserAnAdmin() != 0
     except Exception:
         return False
 
 
-def test_mft():
-    section("mft fast path")
-    root = str(FIXTURES)
+MFT_CALLS = [
+    ("disk_usage", lambda root: pyofiles.disk_usage(root, mft=True)),
+    ("walk", lambda root: pyofiles.walk(root, mft=True)),
+    ("find", lambda root: pyofiles.find(root, names=["readme"], mft=True)),
+]
 
-    calls = [
-        ("disk_usage", lambda: pyofiles.disk_usage(root, mft=True)),
-        ("walk", lambda: pyofiles.walk(root, mft=True)),
-        ("find", lambda: pyofiles.find(root, names=["readme"], mft=True)),
-    ]
 
-    if sys.platform != "win32":
-        # mft=True must raise ValueError on non-Windows builds.
-        for label, call in calls:
-            try:
-                call()
-                check(f"{label} mft=True raises on non-Windows", False, "no exception")
-            except ValueError as e:
-                check(f"{label} mft=True raises ValueError on non-Windows",
-                      "only available on Windows" in str(e), f"msg={e}")
-            except Exception as e:
-                check(f"{label} mft=True raises ValueError on non-Windows", False,
-                      f"wrong exception {type(e).__name__}: {e}")
-        return
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows exposes the MFT fast path")
+@pytest.mark.parametrize(("label", "call"), MFT_CALLS)
+def test_mft_unavailable_off_windows(label, call, tree):
+    with pytest.raises(ValueError, match="only available on Windows"):
+        call(str(tree))
 
-    # Windows: UNC and network paths are rejected regardless of elevation,
-    # even when the share does not exist.
-    try:
+
+@pytest.mark.skipif(sys.platform != "win32", reason="UNC rejection is Windows-specific")
+def test_mft_rejects_unc_paths():
+    with pytest.raises(OSError) as excinfo:
         pyofiles.find(r"\\localhost\nonexistent\share", names=["x"], mft=True)
-        check("find mft=True rejects UNC path", False, "no exception")
-    except OSError as e:
-        msg = str(e)
-        check("find mft=True rejects UNC path with OSError", True)
-        check("UNC error states the requirements",
-              "administrator" in msg and "NTFS" in msg, f"msg={msg}")
-    except Exception as e:
-        check("find mft=True rejects UNC path with OSError", False,
-              f"wrong exception {type(e).__name__}: {e}")
+    message = str(excinfo.value)
+    assert "administrator" in message
+    assert "NTFS" in message
 
+
+@pytest.mark.skipif(sys.platform != "win32", reason="raw volume access is Windows-specific")
+@pytest.mark.parametrize(("label", "call"), MFT_CALLS)
+def test_mft_requires_admin_without_elevation(label, call, tree):
     if _is_windows_admin():
-        # The unprivileged error path cannot be exercised from an elevated
-        # shell; CI covers the real scan in a dedicated workflow step.
-        print("  SKIP  non-admin mft error tests (running elevated)")
-        return
-
-    # Without elevation, opening the raw volume must fail with a clear
-    # OSError that tells the user what is needed.
-    for label, call in calls:
-        try:
-            call()
-            check(f"{label} mft=True raises without admin", False, "no exception")
-        except OSError as e:
-            msg = str(e)
-            check(f"{label} mft=True raises OSError without admin", True)
-            check(f"{label} error mentions administrator",
-                  "administrator" in msg, f"msg={msg}")
-        except Exception as e:
-            check(f"{label} mft=True raises OSError without admin", False,
-                  f"wrong exception {type(e).__name__}: {e}")
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-def main():
-    print("Setting up test fixtures...")
-    setup_fixtures()
-
-    try:
-        test_walk()
-        test_find()
-        test_list_dir()
-        test_index()
-        test_glob()
-        test_disk_usage()
-        test_time_filters()
-        test_walk_name_and_size_filters()
-        test_list_dir_filters()
-        test_glob_filters()
-        test_index_filters()
-        test_disk_usage_filters()
-        test_find_size_only()
-        test_index_collisions()
-        test_list_dir_sorted()
-        test_terminal_output_escaping()
-        test_mft()
-    finally:
-        teardown_fixtures()
-
-    section("RESULTS")
-    print(f"  {passed} passed, {failed} failed, {passed + failed} total")
-    sys.exit(1 if failed else 0)
+        pytest.skip("running elevated; CI covers the real scan separately")
+    with pytest.raises(OSError, match="administrator"):
+        call(str(tree))
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(pytest.main([__file__, "-q"]))

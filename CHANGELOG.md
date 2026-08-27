@@ -1,6 +1,54 @@
 # CHANGELOG
 
 
+## Unreleased
+
+### Bug Fixes
+
+- Validate numeric CLI arguments and harden time parsing
+  (tests-pytest-and-cli-hardening)
+
+`--max-depth` and `--limit` are validated by argparse as integers >= 0 (--limit 0 and
+--max-depth 0 stay meaningful: no matches, and no recursion below the root), du's --depth and
+--top keep accepting 0 for totals-only output, and --threads must now be >= 1 instead of
+silently falling back to the default. Underscore forms like "1_000" and integers too large for
+the native extension are rejected during argument parsing.
+
+parse_time now accepts case-insensitive duration units ("7D", "24H") and timezone-aware ISO
+datetimes ("2024-03-15T10:30:00+02:00" or a trailing "Z") on all supported Python versions; a
+date-only value with a trailing "Z" means UTC midnight, and previously-accepted lenient forms
+like "2024-3-5" keep working. Bare digit strings always mean unix seconds regardless of Python
+version (fromisoformat grew more lenient in 3.11+ and would otherwise reinterpret "20240101" as
+a date), and non-finite values (nan, inf), including overflowing relative durations, are rejected
+instead of silently disabling the time filters. The extension validates time bounds too, so direct
+Python API calls cannot bypass that protection.
+
+Size filters get the same treatment in the extension itself, so the Python API is covered too:
+min_size_mb/max_size_mb values that are NaN, infinite, negative, or too large to represent in
+bytes raise ValueError instead of silently disabling or clamping the bound. Negative CLI values
+are rejected during argument parsing as well.
+
+The MFT sector reader no longer touches storage for zero-length requests or reads an extra sector
+when the requested range ends exactly on a sector boundary. Both cases could spuriously report
+UnexpectedEof near the end of a volume.
+
+### Testing
+
+- Convert the Python suite to real pytest tests
+
+tests/test_pyofiles.py previously used a print-only check harness: under pytest every test passed
+trivially because nothing asserted, so only the script-mode run in CI caught failures. The suite is
+now genuine pytest tests with asserts and per-test tmp_path fixtures (including new coverage for
+CLI parsing, time formats, output escaping, and boundary values). CI installs pytest and runs
+`python -m pytest tests/ -q` instead of invoking the file as a script.
+
+The pyo3 extension-module feature is now opt-in via a package feature of the same name instead of
+being always enabled, following the pyo3 recommendation for crates with Rust unit tests. Plain
+`cargo test` now links libpython, so unit tests link cleanly on every platform (newer toolchains
+defaulting to lld surfaced this); maturin builds enable it through pyproject.toml exactly as
+before, so wheels are unchanged.
+
+
 ## v0.7.2 (2026-08-24)
 
 ### Bug Fixes
