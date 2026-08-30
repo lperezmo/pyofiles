@@ -1,6 +1,14 @@
 # CHANGELOG
 
 
+## v0.7.4 (2026-08-30)
+
+### Bug Fixes
+
+- **deps**: Remove vulnerable pytest 8 resolution
+  ([`de0f3d3`](https://github.com/lperezmo/pyofiles/commit/de0f3d3ffa224c857846ab36b3c5871ceaf35055))
+
+
 ## v0.7.3 (2026-08-27)
 
 ### Bug Fixes
