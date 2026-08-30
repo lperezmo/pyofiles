@@ -42,5 +42,11 @@ commit_message = "chore(release): v{version}"
 [dependency-groups]
 dev = [
     "maturin>=1.12.6",
-    "pytest>=8",
+    "pytest>=9.0.3",
 ]
+
+
+# pytest 9 contains the security fix and requires Python 3.10+.
+# The built extension continues to support Python 3.9.
+[tool.uv.dependency-groups]
+dev = { requires-python = ">=3.10" }
