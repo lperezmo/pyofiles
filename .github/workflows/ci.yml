@@ -15,7 +15,7 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-        python-version: ['3.9', '3.13']
+        python-version: ['3.9', '3.10', '3.13']
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
@@ -29,10 +29,15 @@ jobs:
           args: --release --out dist
       - name: Install and test
         run: |
-          pip install dist/*.whl pytest
+          pip install dist/*.whl
           python -c "import pyofiles; print('walk:', len(pyofiles.walk('.'))); print('find:', len(pyofiles.find('.', extensions=['.rs']))); print('glob:', len(pyofiles.glob('.', '**/*.toml'))); print('list_dir:', len(pyofiles.list_dir('.'))); print('index:', len(pyofiles.index('.', ['.rs', '.toml']))); usage = pyofiles.disk_usage('.'); print(f'disk_usage: {usage.total_files} files, {usage.total_size_mb:.2f} MB'); print('All OK')"
-          python -m pytest tests/ -v
         shell: bash
+      # Keep Python 3.9 wheel/import/CLI coverage without vulnerable pytest 8.
+      - name: Python unit tests
+        if: matrix.python-version != '3.9'
+        run: |
+          python -m pip install "pytest>=9.0.3"
+          python -m pytest tests/ -v
       - name: CLI integration tests
         run: |
           pyofiles --version
@@ -86,3 +91,4 @@ jobs:
               raise AssertionError('expected ValueError from mft=True')
           EOF
         shell: bash
+
