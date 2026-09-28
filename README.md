@@ -112,6 +112,12 @@ pyofiles find ./src --ext .py --json
 pyofiles du . --json | jq '.entries[:5]'
 ```
 
+Put the directory first: `--ext` and `--names` take any number of values,
+so a directory typed after them would be read as another filter. A trailing
+value that can only be a path (it contains `/` or `\`, or is `.`, `..` or a
+drive like `D:`) is still used as the directory, and a path-like value
+anywhere else in those lists is an error.
+
 ### Time formats
 
 Time arguments (`--modified-after`, `--modified-before`, `--created-after`, `--created-before`) accept:
@@ -236,6 +242,11 @@ Parallel glob pattern matching. Returns `list[str]` of full paths.
 
 Patterns with a literal directory prefix (e.g. `src/**/*.py`) start the
 walk at that directory instead of scanning the whole tree.
+
+As with `glob.glob`, `*`, `?` and `[...]` match within one path component,
+so `*.py` only matches files directly in `directory` and `src/*.py` does
+not descend into `src/sub/`; use `**` to recurse. Matching is
+case-insensitive on Windows and case-sensitive elsewhere.
 
 ```python
 paths = pyofiles.glob("/project", "**/*.py")

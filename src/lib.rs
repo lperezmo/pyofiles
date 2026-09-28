@@ -8,7 +8,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 use dashmap::DashMap;
-use globset::Glob as GlobPattern;
+use globset::GlobBuilder;
 use ignore::{WalkBuilder, WalkState};
 
 #[cfg(windows)]
@@ -988,6 +988,10 @@ fn literal_prefix_components(pattern: &str) -> Vec<&str> {
 
 /// Match files against a glob pattern.
 ///
+/// `*`, `?` and `[...]` match within a single path component; use `**`
+/// to cross directories. Matching is case-insensitive on Windows and
+/// case-sensitive elsewhere.
+///
 /// Args:
 ///     directory: Root directory to search.
 ///     pattern: Glob pattern (e.g. "**/*.py", "src/*.rs", "*.{js,ts}").
@@ -1024,7 +1028,13 @@ fn glob(
     let filters = Filters::new(None, None, min_size_mb, max_size_mb, modified_after, modified_before, created_after, created_before)?;
 
     py.detach(|| {
-        let matcher = GlobPattern::new(&pattern)
+        // `*`, `?` and `[...]` never cross a path separator (only `**`
+        // does), matching `glob.glob`. Case sensitivity follows the
+        // platform's usual filesystem: insensitive on Windows.
+        let matcher = GlobBuilder::new(&pattern)
+            .literal_separator(true)
+            .case_insensitive(cfg!(windows))
+            .build()
             .map_err(|e| PyValueError::new_err(format!("Invalid glob pattern: {}", e)))?
             .compile_matcher();
 

@@ -68,6 +68,11 @@ jobs:
           assert all(f.name.lower().endswith('.sys') for f in found), found
           assert all(f.size >= 0 and f.modified for f in found), found
 
+          # Every name is one entry: extension records must not add
+          # duplicates of names their base record already reported.
+          paths = [e.path for e in pyofiles.walk(target, mft=True)]
+          assert len(paths) == len(set(paths)), 'duplicate MFT entries'
+
           # Loose agreement with the walk backend on a stable directory.
           walk_usage = pyofiles.disk_usage(target)
           lo, hi = sorted([usage.total_files, walk_usage.total_files])

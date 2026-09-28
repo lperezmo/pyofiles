@@ -23,6 +23,7 @@ from pyofiles.cli import (
     build_parser,
     escape_terminal_controls,
     format_size,
+    parse_args,
     parse_time,
     print_entries,
 )
@@ -296,6 +297,26 @@ def test_glob_filters(tree: Path):
     assert "large_file.bin" in large
 
 
+def test_glob_star_stays_in_one_directory(tree: Path):
+    def basenames(paths):
+        return {Path(p).name for p in paths}
+
+    # `*` must not cross a separator; only `**` recurses (like glob.glob).
+    assert basenames(pyofiles.glob(str(tree), "*.py")) == set()
+    assert basenames(pyofiles.glob(str(tree), "src/*.py")) == {"main.py", "utils.py"}
+    assert basenames(pyofiles.glob(str(tree), "src/**/*.py")) == {"main.py", "utils.py", "io.py"}
+    assert basenames(pyofiles.glob(str(tree), "*/*.csv")) == {"output.csv"}
+    assert basenames(pyofiles.glob(str(tree), "src/?????.py")) == {"utils.py"}
+
+
+def test_glob_case_follows_platform(tree: Path):
+    matched = {Path(p).name for p in pyofiles.glob(str(tree), "*.PDF")}
+    if sys.platform == "win32":
+        assert matched == {"report_2024.pdf", "invoice_march.pdf"}
+    else:
+        assert matched == set()
+
+
 # ---------------------------------------------------------------------------
 # disk_usage
 # ---------------------------------------------------------------------------
@@ -498,6 +519,60 @@ def test_cli_rejects_bad_numbers(argv):
 def test_cli_accepts_boundary_numbers(argv, attr, expected):
     args = build_parser().parse_args(argv)  # must not raise SystemExit
     assert getattr(args, attr) == expected
+
+
+# ---------------------------------------------------------------------------
+# CLI: directory after a list option
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("argv", [
+    ["find", "--ext", "py", "{dir}"],
+    ["find", "--names", "report", "--ext", "pdf", "{dir}"],
+    ["walk", "--ext", ".py", ".rs", "{dir}"],
+    ["ls", "--names", "main", "{dir}"],
+    ["index", "--ext", ".py", "{dir}"],
+    ["du", "--ext", ".bin", "{dir}"],
+])
+def test_cli_recovers_directory_after_list_option(argv, tree: Path):
+    directory = str(tree / "src")  # absolute, so it always has a separator
+    args = parse_args([a.replace("{dir}", directory) for a in argv])
+    assert args.directory == directory
+    for attr in ("ext", "names"):
+        assert directory not in (getattr(args, attr, None) or [])
+
+
+def test_cli_directory_defaults_to_cwd():
+    args = parse_args(["find", "--ext", "py"])
+    assert args.directory == "."
+    assert args.ext == ["py"]
+    assert parse_args(["glob", "**/*.py"]).directory == "."
+
+
+def test_cli_explicit_directory_untouched(tree: Path):
+    args = parse_args(["find", str(tree), "--ext", "py", "rs"])
+    assert args.directory == str(tree)
+    assert args.ext == ["py", "rs"]
+
+
+@pytest.mark.parametrize("argv", [
+    ["find", ".", "--ext", "py", "src/"],        # directory already given
+    ["find", "--ext", "a/b", "py"],              # path-like value mid-list
+    ["find", "--ext", "src/"],                   # nothing left to filter by
+    ["find", "--names", "..", "x", "--ext", "py"],
+])
+def test_cli_rejects_path_like_filter_values(argv):
+    with pytest.raises(SystemExit) as excinfo:
+        parse_args(argv)
+    assert excinfo.value.code == 2
+
+
+def test_cli_notes_ambiguous_bare_directory(tree: Path, monkeypatch, capsys):
+    monkeypatch.chdir(tree)
+    args = parse_args(["find", "--ext", "py", "src"])
+    assert args.directory == "."
+    assert args.ext == ["py", "src"]
+    assert "put it first" in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------
