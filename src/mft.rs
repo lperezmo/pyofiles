@@ -465,6 +465,7 @@ fn parse_record(ntfs: &Ntfs, fs: &mut VolumeReader, frn: u64) -> Option<RecordDa
     let mut attr_hidden = false;
     let mut size = 0u64;
     let mut have_size = false;
+    let mut have_std_info = false;
     let mut names: Vec<(u64, String, bool)> = Vec::new();
 
     let mut attrs = file.attributes();
@@ -483,6 +484,7 @@ fn parse_record(ntfs: &Ntfs, fs: &mut VolumeReader, frn: u64) -> Option<RecordDa
         };
         match ty {
             NtfsAttributeType::StandardInformation => {
+                have_std_info = true;
                 if let Ok(info) = attribute.structured_value::<_, NtfsStandardInformation>(fs) {
                     modified = nt_to_unix(info.modification_time());
                     created = nt_to_unix(info.creation_time());
@@ -518,8 +520,17 @@ fn parse_record(ntfs: &Ntfs, fs: &mut VolumeReader, frn: u64) -> Option<RecordDa
         }
     }
 
-    // Records without any usable name (extension records, unnamed
-    // metadata) cannot be placed in the tree.
+    // Only base records carry $STANDARD_INFORMATION. An extension record
+    // can still hold $FILE_NAME attributes (a file with many hard links
+    // spills them over), but the base record already reports those names
+    // through its $ATTRIBUTE_LIST, so emitting them here would duplicate
+    // the entries with a zero size and no timestamps.
+    if !have_std_info {
+        return None;
+    }
+
+    // Records without any usable name (unnamed metadata) cannot be
+    // placed in the tree.
     if names.is_empty() {
         return None;
     }

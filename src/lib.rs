@@ -8,7 +8,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 use dashmap::DashMap;
-use globset::Glob as GlobPattern;
+use globset::GlobBuilder;
 use ignore::{WalkBuilder, WalkState};
 
 #[cfg(windows)]
@@ -986,7 +986,34 @@ fn literal_prefix_components(pattern: &str) -> Vec<&str> {
     components[..n].to_vec()
 }
 
+/// Spelling of `component` as stored on disk inside `dir`. On Windows both
+/// the filesystem and the glob matcher ignore case, so a literal prefix
+/// typed as "SRC" would otherwise leak into every returned path. An exact
+/// match wins over a case-folded one; if the directory cannot be read the
+/// pattern's spelling is kept.
+#[cfg(windows)]
+fn on_disk_name(dir: &Path, component: &str) -> std::ffi::OsString {
+    let wanted = component.to_lowercase();
+    let mut folded = None;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name == component {
+                return name;
+            }
+            if folded.is_none() && name.to_string_lossy().to_lowercase() == wanted {
+                folded = Some(name);
+            }
+        }
+    }
+    folded.unwrap_or_else(|| component.into())
+}
+
 /// Match files against a glob pattern.
+///
+/// `*`, `?` and `[...]` match within a single path component; use `**`
+/// to cross directories. Matching is case-insensitive on Windows and
+/// case-sensitive elsewhere.
 ///
 /// Args:
 ///     directory: Root directory to search.
@@ -1024,7 +1051,13 @@ fn glob(
     let filters = Filters::new(None, None, min_size_mb, max_size_mb, modified_after, modified_before, created_after, created_before)?;
 
     py.detach(|| {
-        let matcher = GlobPattern::new(&pattern)
+        // `*`, `?` and `[...]` never cross a path separator (only `**`
+        // does), matching `glob.glob`. Case sensitivity follows the
+        // platform's usual filesystem: insensitive on Windows.
+        let matcher = GlobBuilder::new(&pattern)
+            .literal_separator(true)
+            .case_insensitive(cfg!(windows))
+            .build()
             .map_err(|e| PyValueError::new_err(format!("Invalid glob pattern: {}", e)))?
             .compile_matcher();
 
@@ -1035,6 +1068,8 @@ fn glob(
         let prefix_depth = prefix.len();
         let mut start = base.as_ref().clone();
         for component in &prefix {
+            #[cfg(windows)]
+            let component = on_disk_name(&start, component);
             start.push(component);
         }
         if !start.starts_with(base.as_path()) {

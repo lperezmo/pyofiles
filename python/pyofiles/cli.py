@@ -431,7 +431,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # -- walk --
     p_walk = sub.add_parser("walk", help="recursively walk a directory")
-    p_walk.add_argument("directory", nargs="?", default=".", help="directory to walk (default: .)")
+    p_walk.add_argument("directory", nargs="?", default=None, help="directory to walk (default: .)")
     p_walk.add_argument("--ext", nargs="+", default=None, help="filter by extensions (e.g. .py .rs)")
     p_walk.add_argument("--skip-hidden", action="store_true", help="skip hidden files/dirs")
     p_walk.add_argument("--max-depth", type=non_negative_int, default=None, metavar="N",
@@ -446,7 +446,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # -- find --
     p_find = sub.add_parser("find", help="find files by name, extension, size, or time")
-    p_find.add_argument("directory", nargs="?", default=".", help="directory to search (default: .)")
+    p_find.add_argument("directory", nargs="?", default=None, help="directory to search (default: .)")
     p_find.add_argument("--ext", nargs="+", default=None, help="filter by extensions")
     p_find.add_argument("--skip-hidden", action="store_true", help="skip hidden files/dirs")
     p_find.add_argument("--max-depth", type=non_negative_int, default=None, metavar="N",
@@ -463,7 +463,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # -- ls --
     p_ls = sub.add_parser("ls", help="list directory contents (non-recursive)")
-    p_ls.add_argument("directory", nargs="?", default=".", help="directory to list (default: .)")
+    p_ls.add_argument("directory", nargs="?", default=None, help="directory to list (default: .)")
     p_ls.add_argument("--ext", nargs="+", default=None, help="filter by extensions")
     p_ls.add_argument("--skip-hidden", action="store_true", help="skip hidden files/dirs")
     add_name_args(p_ls)
@@ -474,7 +474,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # -- glob --
     p_glob = sub.add_parser("glob", help="match files with a glob pattern")
-    p_glob.add_argument("directory", nargs="?", default=".", help="root directory (default: .)")
+    p_glob.add_argument("directory", nargs="?", default=None, help="root directory (default: .)")
     p_glob.add_argument("pattern", help="glob pattern (e.g. '**/*.py')")
     p_glob.add_argument("--skip-hidden", action="store_true", help="skip hidden files")
     p_glob.add_argument("--max-depth", type=non_negative_int, default=None, metavar="N",
@@ -487,7 +487,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # -- index --
     p_index = sub.add_parser("index", help="index files by stem and extension")
-    p_index.add_argument("directory", nargs="?", default=".", help="directory to index (default: .)")
+    p_index.add_argument("directory", nargs="?", default=None, help="directory to index (default: .)")
     p_index.add_argument("--ext", nargs="+", required=True, help="extensions to index (e.g. .py .pyi .pyc)")
     p_index.add_argument("--skip-hidden", action="store_true", help="skip hidden files")
     p_index.add_argument("--max-depth", type=non_negative_int, default=None, metavar="N",
@@ -501,7 +501,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # -- du --
     p_du = sub.add_parser("du", help="disk usage analysis")
-    p_du.add_argument("directory", nargs="?", default=".", help="directory to analyze (default: .)")
+    p_du.add_argument("directory", nargs="?", default=None, help="directory to analyze (default: .)")
     p_du.add_argument("--depth", type=non_negative_int, default=1, metavar="N",
                       help="directory depth for grouping, 0 for totals only (default: 1)")
     p_du.add_argument("--top", type=non_negative_int, default=20, metavar="N",
@@ -519,9 +519,74 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main():
+# The list options are nargs="+", so a directory typed after one of them
+# (`pyofiles find --ext py D:\docs`) is swallowed as one more filter value.
+_LIST_OPTIONS = (("ext", "--ext"), ("names", "--names"))
+
+
+def _looks_like_path(value: str) -> bool:
+    """True for values that can only be a directory, never a name filter.
+
+    Filters match file names, which cannot contain this platform's path
+    separators. Nothing else is treated as a path: "." and ".." are
+    legitimate --names substrings, and on POSIX a backslash or colon is a
+    legal file name character.
+    """
+    return any(sep and sep in value for sep in (os.sep, os.altsep))
+
+
+def resolve_directory(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """Recover a directory swallowed by a trailing --ext/--names list.
+
+    Path-like values cannot match anything, so when no directory was given
+    the last such value becomes the directory; any other path-like filter
+    value is an error rather than a search that silently runs on ".".
+    """
+    if args.directory is None:
+        for attr, flag in _LIST_OPTIONS:
+            values = getattr(args, attr, None)
+            if values and _looks_like_path(values[-1]):
+                args.directory = values.pop()
+                if not values:
+                    parser.error(f"argument {flag}: expected at least one value before the directory")
+                break
+
+    for attr, flag in _LIST_OPTIONS:
+        for value in getattr(args, attr, None) or ():
+            if _looks_like_path(value):
+                parser.error(
+                    f"argument {flag}: {value!r} looks like a path, but filters match "
+                    f"file names only. Put the directory first: "
+                    f"pyofiles {args.command} DIR {flag} ..."
+                )
+
+    if args.directory is None:
+        # A bare name like "src" is ambiguous: it is a valid filter, so keep
+        # it as one, but point out the likely mistake. A single value is
+        # left alone: `--ext js` in a repo with a js/ folder is normal, and
+        # moving it would leave no filter at all.
+        for attr, flag in _LIST_OPTIONS:
+            values = getattr(args, attr, None)
+            if values and len(values) >= 2 and os.path.isdir(values[-1]):
+                rest = " ".join(values[:-1])
+                print(
+                    f"note: treating {values[-1]!r} as a {flag} value and searching '.'; "
+                    f"to search that directory put it first: "
+                    f"pyofiles {args.command} {values[-1]} {flag} {rest}",
+                    file=sys.stderr,
+                )
+        args.directory = "."
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    resolve_directory(parser, args)
+    return args
+
+
+def main():
+    args = parse_args()
     try:
         args.func(args)
         sys.stdout.flush()
