@@ -114,9 +114,9 @@ pyofiles du . --json | jq '.entries[:5]'
 
 Put the directory first: `--ext` and `--names` take any number of values,
 so a directory typed after them would be read as another filter. A trailing
-value that can only be a path (it contains `/` or `\`, or is `.`, `..` or a
-drive like `D:`) is still used as the directory, and a path-like value
-anywhere else in those lists is an error.
+value that contains a path separator (`/`, or also `\` on Windows) can never
+match a file name, so it is still used as the directory; a value with a
+separator anywhere else in those lists is an error.
 
 ### Time formats
 

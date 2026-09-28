@@ -82,6 +82,55 @@ jobs:
           EOF
           pyofiles du 'C:\Windows\System32\drivers' --mft --top 3
         shell: bash
+      # A file with many long-named hard links overflows its 1 KB base
+      # record, so NTFS moves $FILE_NAME attributes into extension records.
+      # Each link must come back exactly once with the real size, not again
+      # from the extension record with size 0.
+      - name: MFT hard-link extension records (Windows, elevated)
+        if: runner.os == 'Windows'
+        run: |
+          python - <<'EOF'
+          import collections, ctypes, os, shutil, time
+          import pyofiles
+
+          target = r'C:\pyofiles-mft-links'
+          shutil.rmtree(target, ignore_errors=True)
+          os.makedirs(target)
+          payload = b'x' * 4096
+          first = os.path.join(target, 'base.bin')
+          with open(first, 'wb') as f:
+              f.write(payload)
+          names = {'base.bin'}
+          for i in range(30):
+              name = f'link_{i:02d}_' + 'n' * 120 + '.bin'
+              os.link(first, os.path.join(target, name))
+              names.add(name)
+
+          # Push the new MFT records to disk before reading the raw volume.
+          k32 = ctypes.windll.kernel32
+          k32.CreateFileW.restype = ctypes.c_void_p
+          handle = k32.CreateFileW(r'\\.\C:', 0xC0000000, 3, None, 3, 0, None)
+          if handle not in (None, ctypes.c_void_p(-1).value):
+              k32.FlushFileBuffers(ctypes.c_void_p(handle))
+              k32.CloseHandle(ctypes.c_void_p(handle))
+
+          deadline = time.time() + 60
+          while True:
+              files = [e for e in pyofiles.walk(target, mft=True) if e.is_file]
+              if names <= {e.name for e in files} or time.time() > deadline:
+                  break
+              time.sleep(2)
+
+          counts = collections.Counter(e.name for e in files)
+          assert set(counts) == names, sorted(set(counts) ^ names)[:5]
+          dupes = [n for n, c in counts.items() if c > 1]
+          assert not dupes, f'duplicate MFT entries: {dupes[:3]}'
+          bad = [e for e in files if e.size != len(payload) or not e.modified]
+          assert not bad, bad[:3]
+          print(f'MFT hard links OK: {len(files)} names, no duplicates')
+          shutil.rmtree(target, ignore_errors=True)
+          EOF
+        shell: bash
       - name: MFT unavailable off Windows
         if: runner.os == 'Linux'
         run: |

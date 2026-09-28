@@ -986,6 +986,29 @@ fn literal_prefix_components(pattern: &str) -> Vec<&str> {
     components[..n].to_vec()
 }
 
+/// Spelling of `component` as stored on disk inside `dir`. On Windows both
+/// the filesystem and the glob matcher ignore case, so a literal prefix
+/// typed as "SRC" would otherwise leak into every returned path. An exact
+/// match wins over a case-folded one; if the directory cannot be read the
+/// pattern's spelling is kept.
+#[cfg(windows)]
+fn on_disk_name(dir: &Path, component: &str) -> std::ffi::OsString {
+    let wanted = component.to_lowercase();
+    let mut folded = None;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name == component {
+                return name;
+            }
+            if folded.is_none() && name.to_string_lossy().to_lowercase() == wanted {
+                folded = Some(name);
+            }
+        }
+    }
+    folded.unwrap_or_else(|| component.into())
+}
+
 /// Match files against a glob pattern.
 ///
 /// `*`, `?` and `[...]` match within a single path component; use `**`
@@ -1045,6 +1068,8 @@ fn glob(
         let prefix_depth = prefix.len();
         let mut start = base.as_ref().clone();
         for component in &prefix {
+            #[cfg(windows)]
+            let component = on_disk_name(&start, component);
             start.push(component);
         }
         if !start.starts_with(base.as_path()) {

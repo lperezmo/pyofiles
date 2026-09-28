@@ -317,6 +317,18 @@ def test_glob_case_follows_platform(tree: Path):
         assert matched == set()
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="case-insensitive glob is Windows-only")
+def test_glob_returns_on_disk_casing(tree: Path):
+    # A literal prefix typed in another case must not leak into the paths.
+    for pattern in ("SRC/*.py", "SRC/HELPERS/*.PY", "**/SRC/*.py"):
+        paths = pyofiles.glob(str(tree), pattern)
+        assert paths, pattern
+        for p in paths:
+            rel = Path(p).relative_to(tree).parts
+            assert rel[0] == "src", (pattern, p)
+            assert "HELPERS" not in rel, (pattern, p)
+
+
 # ---------------------------------------------------------------------------
 # disk_usage
 # ---------------------------------------------------------------------------
@@ -559,7 +571,6 @@ def test_cli_explicit_directory_untouched(tree: Path):
     ["find", ".", "--ext", "py", "src/"],        # directory already given
     ["find", "--ext", "a/b", "py"],              # path-like value mid-list
     ["find", "--ext", "src/"],                   # nothing left to filter by
-    ["find", "--names", "..", "x", "--ext", "py"],
 ])
 def test_cli_rejects_path_like_filter_values(argv):
     with pytest.raises(SystemExit) as excinfo:
@@ -567,12 +578,35 @@ def test_cli_rejects_path_like_filter_values(argv):
     assert excinfo.value.code == 2
 
 
+@pytest.mark.parametrize(("argv", "directory", "names"), [
+    (["find", ".", "--names", ".."], ".", [".."]),
+    (["find", "--names", "."], ".", ["."]),
+    (["find", "--names", "v1..2", "..."], ".", ["v1..2", "..."]),
+    (["find", "--names", "a:"], ".", ["a:"]),
+])
+def test_cli_dot_and_colon_names_are_filters(argv, directory, names):
+    # Substring filters like ".." or "." were valid before directory
+    # recovery existed and must not be mistaken for paths.
+    args = parse_args(argv)
+    assert args.directory == directory
+    assert args.names == names
+
+
 def test_cli_notes_ambiguous_bare_directory(tree: Path, monkeypatch, capsys):
     monkeypatch.chdir(tree)
     args = parse_args(["find", "--ext", "py", "src"])
     assert args.directory == "."
     assert args.ext == ["py", "src"]
-    assert "put it first" in capsys.readouterr().err
+    assert "pyofiles find src --ext py" in capsys.readouterr().err
+
+
+def test_cli_no_note_for_single_value_matching_a_folder(tree: Path, monkeypatch, capsys):
+    # `--ext js` in a repo with a js/ folder is a normal command.
+    monkeypatch.chdir(tree)
+    args = parse_args(["find", "--names", "src"])
+    assert args.directory == "."
+    assert args.names == ["src"]
+    assert capsys.readouterr().err == ""
 
 
 # ---------------------------------------------------------------------------

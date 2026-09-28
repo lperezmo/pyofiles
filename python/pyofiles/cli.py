@@ -527,12 +527,12 @@ _LIST_OPTIONS = (("ext", "--ext"), ("names", "--names"))
 def _looks_like_path(value: str) -> bool:
     """True for values that can only be a directory, never a name filter.
 
-    Filters match file names, which cannot contain a path separator, and
-    "." / ".." / a bare drive ("D:") are never meaningful filters.
+    Filters match file names, which cannot contain this platform's path
+    separators. Nothing else is treated as a path: "." and ".." are
+    legitimate --names substrings, and on POSIX a backslash or colon is a
+    legal file name character.
     """
-    if "/" in value or "\\" in value or value in (".", ".."):
-        return True
-    return len(value) == 2 and value[1] == ":" and value[0].isalpha()
+    return any(sep and sep in value for sep in (os.sep, os.altsep))
 
 
 def resolve_directory(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
@@ -562,14 +562,17 @@ def resolve_directory(parser: argparse.ArgumentParser, args: argparse.Namespace)
 
     if args.directory is None:
         # A bare name like "src" is ambiguous: it is a valid filter, so keep
-        # it as one, but point out the likely mistake.
+        # it as one, but point out the likely mistake. A single value is
+        # left alone: `--ext js` in a repo with a js/ folder is normal, and
+        # moving it would leave no filter at all.
         for attr, flag in _LIST_OPTIONS:
             values = getattr(args, attr, None)
-            if values and os.path.isdir(values[-1]):
+            if values and len(values) >= 2 and os.path.isdir(values[-1]):
+                rest = " ".join(values[:-1])
                 print(
                     f"note: treating {values[-1]!r} as a {flag} value and searching '.'; "
                     f"to search that directory put it first: "
-                    f"pyofiles {args.command} {values[-1]} {flag} ...",
+                    f"pyofiles {args.command} {values[-1]} {flag} {rest}",
                     file=sys.stderr,
                 )
         args.directory = "."
