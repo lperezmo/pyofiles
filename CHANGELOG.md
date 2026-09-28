@@ -1,6 +1,36 @@
 # CHANGELOG
 
 
+## v0.7.5 (2026-09-28)
+
+### Bug Fixes
+
+- Address review findings on CLI path detection, glob casing, MFT CI
+  ([`b15cd16`](https://github.com/lperezmo/pyofiles/commit/b15cd16bfa23b2bf799d8969c67a56fd67c37ea5))
+
+- cli: only a platform path separator marks a filter value as a path. "." and ".." are legitimate
+  --names substrings again (they were rejected, a regression), and on POSIX backslashes and colons
+  are legal file name characters. - cli: the "put it first" note needs at least two values, so a
+  single filter that happens to match a folder (`--ext js` next to js/) is quiet, and the suggested
+  command now keeps the remaining filter values. - glob: on Windows, resolve literal prefix
+  components to their on-disk spelling so a pattern typed as "SRC/*.py" returns src\... paths. - ci:
+  the old duplicate check could not fail on System32\drivers. Create a file with 30 long-named hard
+  links, which forces $FILE_NAME into extension records, and assert every link appears once with its
+  size.
+
+- Cli directory parsing, glob separator and case matching, MFT extension records
+  ([`bfd271e`](https://github.com/lperezmo/pyofiles/commit/bfd271e64b5a5fc3398ccbd964ac1edb6a354c5f))
+
+- cli: a directory typed after --ext/--names was swallowed as a filter value and the search silently
+  ran on ".". A trailing path-like value (contains a separator, or is ".", "..", "D:") is now used
+  as the directory; path-like filter values anywhere else are an error; a bare existing directory
+  name keeps its filter meaning but prints a note. - glob: `*`, `?` and `[...]` no longer cross path
+  separators (only `**` does), matching glob.glob. Matching is case-insensitive on Windows. - mft:
+  skip records without $STANDARD_INFORMATION. Extension records can hold spilled-over $FILE_NAME
+  attributes that the base record already reports through its $ATTRIBUTE_LIST, which produced
+  duplicate entries with zero size and no timestamps. CI now asserts no duplicate paths.
+
+
 ## v0.7.4 (2026-08-30)
 
 ### Bug Fixes
